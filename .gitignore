@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.venv/
+.env
+.env.*
+data/
+datasets/
+results/
+checkpoints/
+*.h5ad
+*.pt
+*.pth
+*.ckpt
