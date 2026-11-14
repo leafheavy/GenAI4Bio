@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.elastic.multiprocessing.errors import record
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DistributedSampler
 from tqdm import tqdm
 
 try:
@@ -183,6 +189,8 @@ def train_one_source_flow_fold(
 
     model.to(device)
     model.train()
+    distributed = isinstance(dataloader.sampler, DistributedSampler)
+    primary = not distributed or dist.get_rank() == 0
 
     if early_stopping_patience < 0:
         raise ValueError("early_stopping_patience cannot be negative.")
@@ -201,6 +209,8 @@ def train_one_source_flow_fold(
 
     train_model = model
     if compile_model:
+        if distributed:
+            raise ValueError("Omit --torch-compile for distributed source-flow training.")
         if not hasattr(torch, "compile"):
             raise RuntimeError("torch.compile requires PyTorch 2.x.")
         train_model = torch.compile(
@@ -208,6 +218,12 @@ def train_one_source_flow_fold(
             mode="default",
             fullgraph=False,
             dynamic=None,
+        )
+    if distributed:
+        train_model = DistributedDataParallel(
+            train_model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            gradient_as_bucket_view=True,
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), learning_rate, weight_decay=0.0)
@@ -228,6 +244,8 @@ def train_one_source_flow_fold(
         else range(epochs)
     )
     for epoch in iterator:
+        if distributed:
+            dataloader.sampler.set_epoch(epoch)
         total_loss = 0.0
         batch_count = 0
         for batch_index, (target, condition) in enumerate(dataloader, start=1):
@@ -241,13 +259,17 @@ def train_one_source_flow_fold(
                 dtype=amp_dtype,
                 enabled=use_amp,
             ):
-                loss, _ = conditional_flow_matching_loss(
+                loss, intermediates = conditional_flow_matching_loss(
                     train_model,
                     target,
                     condition,
                 )
+            del intermediates
 
-            if not bool(torch.isfinite(loss).item()):
+            finite = torch.isfinite(loss.detach()).to(dtype=torch.int32)
+            if distributed:
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not finite.item():
                 raise FloatingPointError(
                     "Non-finite source-flow loss detected at "
                     f"epoch {epoch + 1}, batch {batch_index}. Training stopped "
@@ -296,14 +318,26 @@ def train_one_source_flow_fold(
                 f"epoch {epoch + 1}: {preview}."
             )
         mean_loss = total_loss / batch_count
+        if distributed:
+            reduced_loss = torch.tensor(mean_loss, device=device, dtype=torch.float64)
+            dist.all_reduce(reduced_loss)
+            mean_loss = reduced_loss.item() / dist.get_world_size()
         record = {"epoch": float(epoch + 1), "flow_matching_loss": mean_loss}
         if validation_dataloader is not None:
-            validation_loss = evaluate_flow_matching_loss(
-                model,
-                validation_dataloader,
-                device=device,
-                seed=validation_seed,
-            )
+            validation_loss = 0.0
+            if primary:
+                validation_loss = evaluate_flow_matching_loss(
+                    model,
+                    validation_dataloader,
+                    device=device,
+                    seed=validation_seed,
+                )
+            if distributed:
+                shared_loss = torch.tensor(
+                    validation_loss, device=device, dtype=torch.float64
+                )
+                dist.broadcast(shared_loss, src=0)
+                validation_loss = shared_loss.item()
             if not np.isfinite(validation_loss):
                 raise FloatingPointError(
                     "Non-finite source-flow validation loss detected after "
@@ -868,6 +902,17 @@ def train_source_flow_experiment(
     configuration = settings or SourceFlowTrainSettings()
     configuration.validate()
     resolved_device = resolve_device(device)
+    distributed = (
+        dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    )
+    world_size = dist.get_world_size() if distributed else 1
+    rank = dist.get_rank() if distributed else 0
+    primary = rank == 0
+    if configuration.batch_size % world_size:
+        raise ValueError(
+            "--batch-size must be divisible by the number of training processes."
+        )
+    batch_size_per_process = configuration.batch_size // world_size
     resolved_amp_dtype = resolve_amp_dtype(resolved_device, configuration.amp_mode)
     compiled_backward_autocast = _configure_compiled_backward_autocast(
         compile_model=configuration.compile_model,
@@ -888,7 +933,29 @@ def train_source_flow_experiment(
         "parameter_finite_check": True,
         "validation_finite_check": True,
     }
-    destination = ensure_output_dir(output_dir, allow_existing=allow_existing)
+    if distributed:
+        # All workers must apply the same precision and loss scaling before DDP
+        # averages their gradients. In particular, auto may differ across GPUs.
+        precision = [None] * world_size
+        dist.all_gather_object(precision, resolved_amp_dtype)
+        if any(dtype != resolved_amp_dtype for dtype in precision):
+            raise ValueError("GPUs resolved different AMP dtypes. Set --amp fp16 or off.")
+        numerical_contract.update(
+            world_size=world_size, batch_size_per_process=batch_size_per_process
+        )
+        if primary:
+            print(
+                f"Source Flow DDP: {world_size} processes, "
+                f"global batch {configuration.batch_size}, "
+                f"batch per process {batch_size_per_process}, "
+                f"validation batch {configuration.validation_batch_size}.",
+                flush=True,
+            )
+    destination = (
+        ensure_output_dir(output_dir, allow_existing=allow_existing)
+        if primary
+        else Path(output_dir).expanduser().resolve()
+    )
     checkpoint_dir = destination / "checkpoints"
     history_dir = destination / "training_history"
     sc_file, spatial_file, dataset_name = _resolve_input_paths(
@@ -927,8 +994,8 @@ def train_source_flow_experiment(
         "dataset": dataset_name,
         "sc_h5ad": str(sc_file),
         "spatial_h5ad": str(spatial_file),
-        "sc_sha256": sha256_file(sc_file),
-        "spatial_sha256": sha256_file(spatial_file),
+        "sc_sha256": sha256_file(sc_file) if primary else None,
+        "spatial_sha256": sha256_file(spatial_file) if primary else None,
         "sc_shape_raw": list(adata_seq.shape),
         "spatial_shape_raw": list(adata_spatial.shape),
         "sc_shape_after_augmentation": list(prepared.seq_array.shape),
@@ -954,7 +1021,7 @@ def train_source_flow_experiment(
         "device": str(resolved_device),
         "settings": asdict(configuration),
         "model": model_config,
-        "environment": environment_snapshot(),
+        "environment": environment_snapshot() if primary else None,
         "numerical_training_contract": numerical_contract,
         "algorithm_notes": {
             "source_distribution": "standard_normal",
@@ -979,7 +1046,7 @@ def train_source_flow_experiment(
     }
     existing_experiment_path = destination / "experiment.json"
     existing_data_info_path = destination / "data_info.json"
-    if allow_existing and existing_experiment_path.is_file():
+    if primary and allow_existing and existing_experiment_path.is_file():
         existing_experiment = load_json(existing_experiment_path)
         existing_data_info = (
             load_json(existing_data_info_path)
@@ -1005,11 +1072,12 @@ def train_source_flow_experiment(
                 "under different data, model, training, or numerical settings. "
                 "Use a fresh --output-dir."
             )
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    history_dir.mkdir(parents=True, exist_ok=True)
-    save_json(data_info, destination / "data_info.json")
-    save_json(fold_records(folds), destination / "gene_folds.json")
-    save_json(experiment, destination / "experiment.json")
+    if primary:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        history_dir.mkdir(parents=True, exist_ok=True)
+        save_json(data_info, destination / "data_info.json")
+        save_json(fold_records(folds), destination / "gene_folds.json")
+        save_json(experiment, destination / "experiment.json")
 
     all_history: list[dict[str, float]] = []
     all_source_performance: dict[str, dict[str, object]] = {}
@@ -1044,10 +1112,11 @@ def train_source_flow_experiment(
         dataloader = get_data_loader(
             train_expression,
             train_condition,
-            batch_size=configuration.batch_size,
+            batch_size=batch_size_per_process,
             is_shuffle=True,
             seed=configuration.model_seed,
             num_workers=configuration.num_workers,
+            distributed=distributed,
         )
         validation_dataloader = get_data_loader(
             validation_expression,
@@ -1058,6 +1127,10 @@ def train_source_flow_experiment(
             num_workers=configuration.num_workers,
         )
         model = build_source_flow_model(model_config)
+        if distributed:
+            # Keep model initialization shared and sample independent CFM noise
+            # and times on each rank. Fold and sampler seeds stay shared.
+            torch.manual_seed(configuration.model_seed + rank)
         fold_history_path = history_dir / f"fold_{current_fold.fold:02d}.json"
 
         def persist_fold_history(
@@ -1079,15 +1152,19 @@ def train_source_flow_experiment(
             learning_rate=configuration.learning_rate,
             epochs=configuration.epochs,
             device=resolved_device,
-            show_progress=configuration.show_progress,
+            show_progress=configuration.show_progress and primary,
             validation_dataloader=validation_dataloader,
             validation_seed=configuration.model_seed + 10_000 + current_fold.fold,
             amp_mode=configuration.amp_mode,
             compile_model=configuration.compile_model,
             early_stopping_patience=configuration.early_stopping_patience,
             early_stopping_min_delta=configuration.early_stopping_min_delta,
-            history_callback=persist_fold_history,
+            history_callback=persist_fold_history if primary else None,
         )
+        if not primary:
+            del model, optimizer
+            dist.barrier()
+            continue
         for record in history:
             all_history.append({"fold": float(current_fold.fold), **record})
         selected_records = [
@@ -1233,6 +1310,12 @@ def train_source_flow_experiment(
             }
         )
         _atomic_torch_save(checkpoint, checkpoint_path)
+        del model, optimizer, checkpoint
+        if distributed:
+            dist.barrier()
+
+    if not primary:
+        return destination
 
     history_by_fold: dict[int, list[dict[str, float]]] = {}
     aggregate_history_path = destination / "train_history.csv"
@@ -1339,8 +1422,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sc-path", default=None)
     parser.add_argument("--spatial-path", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--device", default=None, help="Use --device cuda or omit it with torchrun."
+    )
+    parser.add_argument("--local-rank", "--local_rank", type=int, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=512,
+        help="Total training batch size across all GPUs.",
+    )
     parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--depth", type=int, default=6)
     parser.add_argument("--heads", type=int, default=16)
@@ -1411,18 +1502,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-compile",
         action="store_true",
-        help="Compile the training model with torch.compile.",
+        help="Compile the training model with torch.compile (single device).",
     )
     return parser
 
 
+@record
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _build_parser().parse_args(argv)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
     if args.force_evaluation and not args.evaluation_only:
         raise ValueError("--force-evaluation requires --evaluation-only.")
     if args.evaluation_only and args.start_fold is not None:
         raise ValueError("--start-fold is only available during training.")
     if args.evaluation_only:
+        if distributed:
+            raise ValueError("Run --evaluation-only with python on a single device.")
         output = reevaluate_source_flow_run(
             args.output_dir,
             device=args.device,
@@ -1463,20 +1559,46 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
     )
+    device = args.device
+    if distributed:
+        if device not in (None, "cuda"):
+            raise ValueError(
+                "With torchrun, omit --device or pass --device cuda. "
+                "Use CUDA_VISIBLE_DEVICES to select GPUs."
+            )
+        if args.torch_compile:
+            raise ValueError("Omit --torch-compile for distributed source-flow training.")
+        if not dist.is_nccl_available():
+            raise RuntimeError(
+                "Multi-GPU training requires a PyTorch build with CUDA and NCCL."
+            )
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        if local_world_size > torch.cuda.device_count():
+            raise RuntimeError("torchrun requested more workers than visible CUDA GPUs.")
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+        # Other ranks wait while rank 0 runs the per-fold ODE evaluation.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+    # On failure let torchrun report the error and stop peers that may be
+    # waiting in a collective. Explicitly tear down on a successful run.
     output = train_source_flow_experiment(
         output_dir=args.output_dir,
         dataset=args.dataset,
         data_root=args.data_root,
         sc_path=args.sc_path,
         spatial_path=args.spatial_path,
-        device=args.device,
+        device=device,
         settings=settings,
         fold=args.fold,
         start_fold=args.start_fold,
         max_train_samples=args.max_train_samples,
         allow_existing=args.allow_existing,
     )
-    print(output)
+    if not distributed or dist.get_rank() == 0:
+        print(output)
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

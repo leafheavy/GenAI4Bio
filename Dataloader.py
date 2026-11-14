@@ -18,7 +18,7 @@ import torch
 from anndata import AnnData
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import MaxAbsScaler
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
 
 DEFAULT_DATA_ROOT = Path("/Dataset/yezhong/ai4bio/stDiff_dataset")
@@ -478,6 +478,7 @@ def get_data_loader(
     seed: int = 1202,
     num_workers: int = 0,
     pin_memory: bool | None = None,
+    distributed: bool = False,
 ) -> DataLoader:
     """Build the common two-field DataLoader with a seeded CPU generator."""
 
@@ -496,10 +497,16 @@ def get_data_loader(
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     dataset = TensorDataset(data_tensor, condition_tensor)
+    sampler = (
+        DistributedSampler(dataset, shuffle=is_shuffle, seed=seed)
+        if distributed
+        else None
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=is_shuffle,
+        shuffle=is_shuffle and sampler is None,
+        sampler=sampler,
         drop_last=False,
         generator=generator,
         num_workers=num_workers,
