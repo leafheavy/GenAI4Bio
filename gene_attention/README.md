@@ -29,7 +29,6 @@ python MyCode/training.py \
   --steps 1500 \
   --epochs 900 \
   --learning-rate 0.00016046744893538737 \
-  --noise-std 10 \
   --device cuda:0 \
   --seed 42
 
@@ -74,12 +73,14 @@ dataset5 不额外指定时与上表一致；dataset2 若要复现官方配置�
 | diffusion steps | 1500 |
 | epochs | 900 |
 | learning rate | 0.00016046744893538737 |
-| augmentation noise std | 10 |
+| 源域增强 | `--augment-source --noise-std 10` |
 | gene folds | 5 |
 | fold random state | 0 |
 | per-fold model seed | 1202 |
 | diffusion beta schedule | cosine |
 | prediction target | noise |
+
+`MyCode/training.py` 默认关闭源域增强。复现上表的增强设置时显式传入 `--augment-source`。
 
 送入 batch-attention 模型的三个参数在两个阶段分别是：
 

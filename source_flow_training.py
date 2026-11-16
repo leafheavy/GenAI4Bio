@@ -177,6 +177,8 @@ class _FoldCheckpoints:
         state = torch.load(self.latest, map_location="cpu", weights_only=False)
         if state.get("version") != 1 or state.get("fold") != self.metadata["fold"]:
             raise ValueError(f"Invalid source-flow training checkpoint: {self.latest}")
+        if state.get("augment_source", True) != self.metadata["augment_source"]:
+            raise ValueError(f"Checkpoint source augmentation differs: {self.latest}")
         for field in _RESUME_SPLIT_FIELDS:
             value = self.metadata[field]
             if not np.array_equal(state["split"][field], value):
@@ -251,6 +253,7 @@ class SourceFlowTrainSettings:
     compile_model: bool = False
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
+    augment_source: bool = False
 
     def validate(self) -> None:
         if self.batch_size < 1 or self.epochs < 1:
@@ -523,6 +526,7 @@ def train_one_source_flow_fold(
                     {
                         "version": 1,
                         "fold": checkpoints.metadata["fold"],
+                        "augment_source": checkpoints.metadata["augment_source"],
                         "split": {
                             field: checkpoints.metadata[field]
                             for field in _RESUME_SPLIT_FIELDS
@@ -582,12 +586,15 @@ def _split_source_cells(
     validation_fraction: float,
     *,
     generator: torch.Generator,
+    augment_source: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep the original/augmented copy of each source cell in one split."""
+    """Split source cells, keeping each augmentation copy with its original."""
 
-    if num_cells < 4 or num_cells % 2:
+    if augment_source and num_cells % 2:
         raise ValueError("Augmented source data must contain paired cells.")
-    original_count = num_cells // 2
+    original_count = num_cells // 2 if augment_source else num_cells
+    if original_count < 2:
+        raise ValueError("Training and validation require at least two source cells.")
     validation_count = min(
         original_count - 1,
         max(1, int(round(original_count * validation_fraction))),
@@ -595,6 +602,8 @@ def _split_source_cells(
     order = torch.randperm(original_count, generator=generator)
     validation_base = order[:validation_count]
     training_base = order[validation_count:]
+    if not augment_source:
+        return training_base, validation_base
     return (
         torch.cat((training_base, training_base + original_count)),
         torch.cat((validation_base, validation_base + original_count)),
@@ -733,6 +742,7 @@ def reevaluate_source_flow_run(
     if not isinstance(run_settings, Mapping):
         raise ValueError("experiment.json has no valid source-flow settings.")
     defaults = SourceFlowTrainSettings()
+    augment_source = experiment.get("augment_source", True)
     resolved_device = resolve_device(device)
     adata_seq, adata_spatial = load_paired_h5ad(resolved_sc, resolved_spatial)
     prepared = preprocess_pair(
@@ -740,6 +750,7 @@ def reevaluate_source_flow_run(
         adata_spatial,
         method="stdiff",
         noise_std=float(run_settings.get("noise_std", defaults.noise_std)),
+        augment_source=augment_source,
         leiden_random_state=int(run_settings.get("split_seed", defaults.split_seed)),
         preprocessing=experiment.get("preprocessing", LEGACY_PREPROCESSING),
     )
@@ -776,6 +787,8 @@ def reevaluate_source_flow_run(
             "preprocessing", LEGACY_PREPROCESSING
         ):
             raise ValueError(f"Checkpoint preprocessing mismatch: {checkpoint_path}")
+        if checkpoint.get("augment_source", True) != augment_source:
+            raise ValueError(f"Checkpoint source augmentation mismatch: {checkpoint_path}")
         if list(checkpoint.get("genes", [])) != genes:
             raise ValueError(f"Checkpoint gene order mismatch: {checkpoint_path}")
 
@@ -970,6 +983,7 @@ def reevaluate_source_flow_run(
         checkpoint["target_transfer_performance"] = target_performance
         checkpoint["target_transfer_spot_indices"] = target_transfer_indices
         checkpoint["performance"] = source_performance
+        checkpoint["augment_source"] = augment_source
         checkpoint["training_status"] = "complete"
         checkpoint["evaluation_only_revalidation"] = {
             "weights_retrained": False,
@@ -1162,6 +1176,7 @@ def train_source_flow_experiment(
         adata_spatial,
         method="stdiff",
         noise_std=configuration.noise_std,
+        augment_source=configuration.augment_source,
         leiden_random_state=configuration.split_seed,
         preprocessing=GENE_LOCAL_PREPROCESSING,
     )
@@ -1208,13 +1223,15 @@ def train_source_flow_experiment(
         "mlp_ratio": configuration.mlp_ratio,
         "time_embedding_scale": configuration.time_embedding_scale,
     }
+    training_settings = asdict(configuration)
     experiment = {
         "method": "source_flow",
         "preprocessing": GENE_LOCAL_PREPROCESSING,
+        "augment_source": configuration.augment_source,
         "dataset": dataset_name,
         "output_dir": str(destination),
         "device": str(resolved_device),
-        "settings": asdict(configuration),
+        "settings": training_settings,
         "max_train_samples": max_train_samples,
         "model": model_config,
         "environment": environment_snapshot() if primary else None,
@@ -1245,12 +1262,25 @@ def train_source_flow_experiment(
             if existing_data_info_path.is_file()
             else None
         )
+        saved_settings = (
+            existing_experiment.get("settings")
+            if isinstance(existing_experiment, Mapping)
+            else None
+        )
+        saved_augmentation = (
+            existing_experiment.get("augment_source", True)
+            if isinstance(existing_experiment, Mapping)
+            else True
+        )
         compatible = bool(
             isinstance(existing_experiment, Mapping)
             and isinstance(existing_data_info, Mapping)
             and existing_experiment.get("method") == "source_flow"
             and existing_experiment.get("preprocessing") == GENE_LOCAL_PREPROCESSING
-            and existing_experiment.get("settings") == asdict(configuration)
+            and saved_augmentation == configuration.augment_source
+            and isinstance(saved_settings, Mapping)
+            and {"augment_source": saved_augmentation, **saved_settings}
+            == training_settings
             and existing_experiment.get("max_train_samples") == max_train_samples
             and existing_experiment.get("model") == model_config
             and existing_experiment.get("numerical_training_contract")
@@ -1293,6 +1323,7 @@ def train_source_flow_experiment(
                 if (
                     previous.get("method") != "source_flow"
                     or previous.get("fold") != current_fold.fold
+                    or previous.get("augment_source", True) != configuration.augment_source
                 ):
                     raise ValueError(f"Source-flow checkpoint mismatch: {checkpoint_path}")
                 status = previous.get("training_status", "complete")
@@ -1319,6 +1350,7 @@ def train_source_flow_experiment(
             len(fold_data.train_expression),
             configuration.validation_fraction,
             generator=split_generator,
+            augment_source=configuration.augment_source,
         )
         if max_train_samples is not None:
             if max_train_samples < 1:
@@ -1360,6 +1392,7 @@ def train_source_flow_experiment(
         fold_history_path = history_dir / f"fold_{current_fold.fold:02d}.json"
         checkpoint_metadata = {
             "preprocessing": GENE_LOCAL_PREPROCESSING,
+            "augment_source": configuration.augment_source,
             "method": "source_flow",
             "flow_matching_contract": {
                 "version": 1,
@@ -1379,7 +1412,7 @@ def train_source_flow_experiment(
             "genes": prepared.genes.tolist(),
             "mask": fold_data.mask,
             "model_config": model_config,
-            "training_settings": asdict(configuration),
+            "training_settings": training_settings,
             "train_indices": train_indices,
             "validation_indices": validation_indices,
             "target_transfer_spot_indices": target_transfer_indices,
@@ -1664,7 +1697,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--epochs", type=int, default=900)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--noise-std", type=float, default=10.0)
+    parser.add_argument(
+        "--augment-source",
+        action="store_true",
+        help="Append one fixed-offset copy of each source cell.",
+    )
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=10.0,
+        help="Fixed expression offset used by --augment-source.",
+    )
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--model-seed", type=int, default=1202)
@@ -1772,6 +1815,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         noise_std=args.noise_std,
+        augment_source=args.augment_source,
         n_splits=args.n_splits,
         split_seed=args.split_seed,
         model_seed=args.model_seed,

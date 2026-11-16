@@ -287,6 +287,32 @@ class SourceFlowCheckpointArchitectureTests(unittest.TestCase):
 
 
 class GeneLocalPreprocessingTests(unittest.TestCase):
+    def test_source_augmentation_is_opt_in(self) -> None:
+        try:
+            import numpy as np
+            from anndata import AnnData
+            try:
+                from .Dataloader import preprocess_pair
+            except ImportError:
+                from Dataloader import preprocess_pair
+        except ModuleNotFoundError as error:
+            self.skipTest(f"Preprocessing dependencies unavailable: {error}")
+
+        source = AnnData(np.array([[0, 2], [3, 4], [5, 6]], dtype=np.float32))
+        spatial = AnnData(np.array([[1, 2], [3, 0]], dtype=np.float32))
+        default = preprocess_pair(source, spatial, method="stdiff", noise_std=10.0)
+        augmented = preprocess_pair(source, spatial, method="stdiff", augment_source=True)
+
+        self.assertEqual(default.seq_array.shape, source.shape)
+        self.assertEqual(augmented.seq_array.shape[0], 2 * source.n_obs)
+        np.testing.assert_array_equal(augmented.seq_array[:source.n_obs], default.seq_array)
+        shifted_log = np.log1p(source.X + 10.0)
+        np.testing.assert_allclose(
+            augmented.seq_array[source.n_obs:], shifted_log / (1.0 + shifted_log)
+        )
+        np.testing.assert_array_equal(augmented.spatial_array, default.spatial_array)
+        self.assertEqual(source.X[0, 0], 0.0)
+
     def test_hidden_raw_genes_cannot_change_kept_condition(self) -> None:
         try:
             import numpy as np

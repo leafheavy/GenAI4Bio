@@ -67,6 +67,7 @@ class TrainSettings:
     show_progress: bool = True
     deterministic: bool = False
     make_plots: bool = True
+    augment_source: bool = False
 
     @classmethod
     def from_mapping(
@@ -272,6 +273,16 @@ def train_experiment(
         existing = load_json(existing_experiment_path)
         if existing.get("preprocessing", LEGACY_PREPROCESSING) != GENE_LOCAL_PREPROCESSING:
             raise ValueError("Existing run uses legacy preprocessing; choose a new output directory.")
+        existing_settings = existing.get("settings", {})
+        existing_augmentation = existing_settings.get("augment_source", True)
+        existing_offset = existing_settings.get("noise_std", TrainSettings.noise_std)
+        if existing_augmentation != settings.augment_source or (
+            settings.augment_source and existing_offset != settings.noise_std
+        ):
+            raise ValueError(
+                "Existing run uses different source augmentation settings; "
+                "choose a new output directory."
+            )
         existing_architecture = existing.get("model", {}).get("architecture")
         if existing_architecture is None and existing.get("method") == "imdt":
             existing_architecture = BATCH_ATTENTION
@@ -295,6 +306,7 @@ def train_experiment(
         adata_seq,
         adata_spatial,
         method=method_key,
+        augment_source=settings.augment_source,
         noise_std=settings.noise_std,
         leiden_resolution=settings.leiden_resolution,
         leiden_random_state=settings.split_seed,
@@ -439,7 +451,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--epochs", type=int, default=900)
     parser.add_argument("--learning-rate", type=float, default=None)
-    parser.add_argument("--noise-std", type=float, default=10.0)
+    parser.add_argument(
+        "--augment-source",
+        action="store_true",
+        help="Duplicate source cells with a fixed expression offset.",
+    )
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=10.0,
+        help="Fixed expression offset used with --augment-source (default: 10.0).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allow-existing", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
@@ -467,6 +489,7 @@ def main() -> None:
             "diffusion_steps": args.steps,
             "epochs": args.epochs,
             "learning_rate": args.learning_rate,
+            "augment_source": args.augment_source,
             "noise_std": args.noise_std,
             "show_progress": not args.no_progress,
             "make_plots": not args.no_plots,

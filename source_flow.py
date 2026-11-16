@@ -842,6 +842,7 @@ def load_source_flow_run(
     if experiment.get("method") != "source_flow":
         raise ValueError(f"Run is not a source_flow experiment: {root}")
     preprocessing = experiment.get("preprocessing", LEGACY_PREPROCESSING)
+    augment_source = experiment.get("augment_source", True)
     if require_observed_only_preprocessing and preprocessing != GENE_LOCAL_PREPROCESSING:
         raise ValueError(
             "Target observed-only re-masking requires gene-local preprocessing. "
@@ -864,6 +865,7 @@ def load_source_flow_run(
         adata_seq,
         adata_spatial,
         method="stdiff",
+        augment_source=augment_source,
         noise_std=float(settings["noise_std"]),
         leiden_resolution=float(settings.get("leiden_resolution", 0.4)),
         leiden_random_state=int(settings["split_seed"]),
@@ -893,6 +895,8 @@ def load_source_flow_run(
     )
     if checkpoint.get("preprocessing", LEGACY_PREPROCESSING) != preprocessing:
         raise ValueError("Checkpoint preprocessing differs from experiment.json.")
+    if checkpoint.get("augment_source", True) != augment_source:
+        raise ValueError("Checkpoint source augmentation differs from experiment.json.")
     if checkpoint["genes"] != list(genes):
         raise ValueError("Checkpoint gene order differs from target expression.")
     return LoadedSourceFlowRun(

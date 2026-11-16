@@ -325,7 +325,10 @@ def _cluster_leiden(
     resolution: float = 0.4,
     random_state: int = 0,
 ) -> np.ndarray:
-    sc.pp.pca(adata, n_comps=min(10, adata.n_vars))
+    n_components = min(10, adata.n_obs - 1, adata.n_vars - 1)
+    if n_components < 1:
+        raise ValueError("Leiden preprocessing requires at least two observations and genes.")
+    sc.pp.pca(adata, n_comps=n_components)
     sc.pp.neighbors(adata)
     sc.tl.leiden(adata, resolution=resolution, random_state=random_state)
     return adata.obs["leiden"].cat.codes.to_numpy(dtype=np.int64)
@@ -336,13 +339,14 @@ def preprocess_pair(
     adata_spatial: AnnData,
     *,
     method: str,
+    augment_source: bool = False,
     noise_std: float = 10.0,
     fixed_augmentation: bool = True,
     leiden_resolution: float = 0.4,
     leiden_random_state: int = 0,
     preprocessing: str = GENE_LOCAL_PREPROCESSING,
 ) -> PreparedData:
-    """Preprocess both domains; new runs use a gene-local, mask-safe scale."""
+    """Preprocess both domains, optionally adding perturbed source copies."""
 
     method_key = method.strip().lower()
     if method_key not in {"stdiff", "imdt"}:
@@ -355,9 +359,9 @@ def preprocess_pair(
         adata_spatial,
         require_spatial_coords=(method_key == "imdt"),
     )
-    seq = data_augment(
-        adata_seq.copy(), fixed=fixed_augmentation, noise_std=noise_std
-    )
+    seq = adata_seq.copy()
+    if augment_source:
+        seq = data_augment(seq, fixed=fixed_augmentation, noise_std=noise_std)
     spatial = adata_spatial.copy()
 
     if preprocessing == LEGACY_PREPROCESSING:

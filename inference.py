@@ -361,6 +361,8 @@ def run_inference(
     fold_records = load_json(fold_path)
     method = str(experiment["method"]).lower()
     settings = experiment["settings"]
+    # Runs created before this setting always augmented the source.
+    augment_source = settings.get("augment_source", True)
     model_config = experiment["model"]
     resolved_device = resolve_device(device or experiment.get("device"))
 
@@ -380,6 +382,7 @@ def run_inference(
         adata_seq,
         adata_spatial,
         method=method,
+        augment_source=augment_source,
         noise_std=float(settings["noise_std"]),
         leiden_resolution=float(settings["leiden_resolution"]),
         leiden_random_state=int(settings["split_seed"]),
@@ -420,6 +423,9 @@ def run_inference(
             raise ValueError(f"Fold mismatch in {checkpoint_file}.")
         if checkpoint["method"] != method:
             raise ValueError(f"Method mismatch in {checkpoint_file}.")
+        checkpoint_settings = checkpoint.get("training_settings", {})
+        if checkpoint_settings.get("augment_source", True) != augment_source:
+            raise ValueError(f"Source augmentation mismatch in {checkpoint_file}.")
         if list(checkpoint["genes"]) != prepared.genes.tolist():
             raise ValueError(f"Gene identity mismatch in {checkpoint_file}.")
         architecture = checkpoint_attention_architecture(method, model_config, checkpoint)
@@ -517,6 +523,7 @@ def run_inference(
             "architecture": run_architecture,
             "checkpoint_dir": str(checkpoints_path),
             "checkpoint_sha256": checkpoint_hashes,
+            "augment_source": augment_source,
             "inference_seed": inference_seed,
             "batch_size": loader_batch_size,
             "use_repaint": use_repaint,
