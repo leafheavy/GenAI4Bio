@@ -1,4 +1,4 @@
-"""Train row-separable gene-attention source flow-matching models."""
+"""Train row-separable gene-attention conditional flow-matching models."""
 
 from __future__ import annotations
 
@@ -179,6 +179,8 @@ class _FoldCheckpoints:
             raise ValueError(f"Invalid source-flow training checkpoint: {self.latest}")
         if state.get("augment_source", True) != self.metadata["augment_source"]:
             raise ValueError(f"Checkpoint source augmentation differs: {self.latest}")
+        if state.get("training_domain", "source") != self.metadata["training_domain"]:
+            raise ValueError(f"Checkpoint training domain differs: {self.latest}")
         for field in _RESUME_SPLIT_FIELDS:
             value = self.metadata[field]
             if not np.array_equal(state["split"][field], value):
@@ -254,8 +256,13 @@ class SourceFlowTrainSettings:
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
     augment_source: bool = False
+    training_domain: str = "source"
 
     def validate(self) -> None:
+        if self.training_domain not in ("source", "target"):
+            raise ValueError("training_domain must be 'source' or 'target'.")
+        if self.training_domain == "target" and self.augment_source:
+            raise ValueError("--augment-source is only supported for source training.")
         if self.batch_size < 1 or self.epochs < 1:
             raise ValueError("batch_size and epochs must be positive.")
         if self.hidden_size < 1 or self.depth < 1 or self.num_heads < 1:
@@ -303,7 +310,7 @@ def train_one_source_flow_fold(
     history_callback: Optional[Callable[[Sequence[Mapping[str, float]]], None]] = None,
     checkpoints: Optional[_FoldCheckpoints] = None,
 ) -> tuple[list[dict[str, float]], torch.optim.Optimizer]:
-    """Train straight-path conditional flow matching on source scRNA only."""
+    """Train straight-path conditional flow matching on the provided split."""
 
     model.to(device)
     model.train()
@@ -527,6 +534,7 @@ def train_one_source_flow_fold(
                         "version": 1,
                         "fold": checkpoints.metadata["fold"],
                         "augment_source": checkpoints.metadata["augment_source"],
+                        "training_domain": checkpoints.metadata["training_domain"],
                         "split": {
                             field: checkpoints.metadata[field]
                             for field in _RESUME_SPLIT_FIELDS
@@ -610,6 +618,17 @@ def _split_source_cells(
     )
 
 
+def split_target_spots(
+    num_spots: int, *, seed: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return disjoint ST train, validation and test rows in a 60/20/20 split."""
+    if num_spots < 3:
+        raise ValueError("Target training requires at least three ST spots.")
+    heldout_count = max(1, round(num_spots * 0.2))
+    order = torch.randperm(num_spots, generator=torch.Generator().manual_seed(seed))
+    return order[2 * heldout_count :], order[heldout_count : 2 * heldout_count], order[:heldout_count]
+
+
 def _resolve_input_paths(
     dataset: str,
     data_root: str,
@@ -629,26 +648,26 @@ def _resolve_input_paths(
     return resolved.sc_h5ad, resolved.spatial_h5ad, resolved.dataset
 
 
-def _is_source_only_performance(value: object) -> bool:
+def _is_validation_performance(value: object, evaluation_domain: str) -> bool:
     if not isinstance(value, Mapping):
         return False
     context = value.get("context")
     return bool(
         isinstance(context, Mapping)
-        and context.get("evaluation_domain") == "source_validation"
+        and context.get("evaluation_domain") == evaluation_domain
         and context.get("evaluation_role") == "checkpoint_filter"
         and value.get("quality_gate_applied") is True
         and isinstance(value.get("passed"), bool)
     )
 
 
-def _is_target_report_only_performance(value: object) -> bool:
+def _is_report_only_performance(value: object, evaluation_domain: str) -> bool:
     if not isinstance(value, Mapping):
         return False
     context = value.get("context")
     return bool(
         isinstance(context, Mapping)
-        and context.get("evaluation_domain") == "target_spatial"
+        and context.get("evaluation_domain") == evaluation_domain
         and context.get("evaluation_role") == "report_only"
         and value.get("quality_gate_applied") is False
         and value.get("passed") is None
@@ -683,7 +702,7 @@ def reevaluate_source_flow_run(
     force_evaluation: bool = False,
     fail_on_performance: bool = True,
 ) -> Path:
-    """Add source-only filtering and target report-only metrics to old weights.
+    """Recompute validation and held-out ST metrics for saved flow weights.
 
     The saved model and optimizer states are never trained or modified.  The
     checkpoint file is atomically rewritten only to attach evaluation metadata.
@@ -726,6 +745,15 @@ def reevaluate_source_flow_run(
     fold_records = load_json(folds_path)
     if experiment.get("method") != "source_flow":
         raise ValueError(f"Run is not a source_flow experiment: {root}")
+    training_domain = experiment.get("training_domain", "source")
+    if training_domain not in ("source", "target"):
+        raise ValueError(f"Unknown training domain in {experiment_path}.")
+    target_training = training_domain == "target"
+    validation_domain = f"{training_domain}_validation"
+    validation_key = "target_validation_performance" if target_training else "source_performance"
+    report_domain = "target_test" if target_training else "target_spatial"
+    report_key = "target_test_performance" if target_training else "target_transfer_performance"
+    validation_summary = validation_key if target_training else "source_flow_performance"
     if not isinstance(fold_records, list) or not fold_records:
         raise ValueError("gene_folds.json must contain a non-empty list.")
     if (sc_path is None) != (spatial_path is None):
@@ -779,6 +807,8 @@ def reevaluate_source_flow_run(
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if checkpoint.get("method") != "source_flow":
             raise ValueError(f"Checkpoint is not source_flow: {checkpoint_path}")
+        if checkpoint.get("training_domain", "source") != training_domain:
+            raise ValueError(f"Checkpoint training domain mismatch: {checkpoint_path}")
         if checkpoint.get("training_status") == "training_in_progress":
             raise ValueError(f"Fold {fold_number} is unfinished. Continue with --resume.")
         if int(checkpoint.get("fold", -1)) != fold_number:
@@ -792,16 +822,16 @@ def reevaluate_source_flow_run(
         if list(checkpoint.get("genes", [])) != genes:
             raise ValueError(f"Checkpoint gene order mismatch: {checkpoint_path}")
 
-        source_performance = checkpoint.get("source_performance")
-        target_performance = checkpoint.get("target_transfer_performance")
+        validation_performance = checkpoint.get(validation_key)
+        report_performance = checkpoint.get(report_key)
         if (
             not force_evaluation
-            and _is_source_only_performance(source_performance)
-            and _is_target_report_only_performance(target_performance)
+            and _is_validation_performance(validation_performance, validation_domain)
+            and _is_report_only_performance(report_performance, report_domain)
         ):
             skipped_folds.append(fold_number)
             _remove_latest_checkpoint(_latest_checkpoint_path(root, fold_number))
-            if source_performance.get("passed") is not True:
+            if validation_performance.get("passed") is not True:
                 failed_folds.append(fold_number)
             print(
                 f"[evaluation-only] fold {fold_number}: current evaluations "
@@ -825,18 +855,26 @@ def reevaluate_source_flow_run(
             test_genes=tuple(genes[index] for index in test_indices),
         )
         fold_data = build_fold_data(prepared, current_fold, method="stdiff")
-        source_train_indices = _validated_saved_indices(
+        if target_training:
+            domain_expression = fold_data.spatial_expression
+            domain_condition = fold_data.spatial_condition
+            domain_names = np.asarray(prepared.adata_spatial.obs_names)
+        else:
+            domain_expression = fold_data.train_expression
+            domain_condition = fold_data.train_condition
+            domain_names = np.asarray(prepared.adata_seq.obs_names)
+        train_indices = _validated_saved_indices(
             checkpoint.get("train_indices"),
             name="train_indices",
-            upper_bound=len(fold_data.train_expression),
+            upper_bound=len(domain_expression),
         )
-        source_validation_indices = _validated_saved_indices(
+        validation_indices = _validated_saved_indices(
             checkpoint.get("validation_indices"),
             name="validation_indices",
-            upper_bound=len(fold_data.train_expression),
+            upper_bound=len(domain_expression),
         )
-        if torch.isin(source_train_indices, source_validation_indices).any():
-            raise ValueError("Saved source train/validation indices overlap.")
+        if torch.isin(train_indices, validation_indices).any():
+            raise ValueError("Saved training and validation indices overlap.")
 
         checkpoint_settings = checkpoint.get("training_settings")
         if not isinstance(checkpoint_settings, Mapping):
@@ -855,13 +893,9 @@ def reevaluate_source_flow_run(
         model_seed = int(setting("model_seed"))
         num_workers = int(setting("num_workers"))
 
-        train_expression = fold_data.train_expression[source_train_indices.numpy()]
-        validation_expression = fold_data.train_expression[
-            source_validation_indices.numpy()
-        ]
-        validation_condition = fold_data.train_condition[
-            source_validation_indices.numpy()
-        ]
+        train_expression = domain_expression[train_indices.numpy()]
+        validation_expression = domain_expression[validation_indices.numpy()]
+        validation_condition = domain_condition[validation_indices.numpy()]
         validation_dataloader = get_data_loader(
             validation_expression,
             validation_condition,
@@ -882,16 +916,14 @@ def reevaluate_source_flow_run(
             seed=model_seed + 10_000 + fold_number,
         )
         print(f"[evaluation-only] fold {fold_number}: evaluating saved weights.")
-        source_performance = evaluate_flow_imputation(
+        validation_performance = evaluate_flow_imputation(
             model,
             torch.as_tensor(validation_expression),
             torch.as_tensor(validation_condition),
             target_gene_indices=test_indices,
             baseline_mean=torch.as_tensor(train_expression.mean(axis=0)),
             genes=genes,
-            spot_names=np.asarray(prepared.adata_seq.obs_names)[
-                source_validation_indices.numpy()
-            ].tolist(),
+            spot_names=domain_names[validation_indices.numpy()].tolist(),
             validation_cfm_loss=validation_cfm_loss,
             device=resolved_device,
             batch_size=validation_batch_size,
@@ -903,12 +935,12 @@ def reevaluate_source_flow_run(
             ode_atol=1e-5,
             max_relative_mse=max_validation_relative_mse,
             min_median_spcc=min_validation_spcc,
-            output_dir=root / "source_performance" / f"fold_{fold_number:02d}",
+            output_dir=root / validation_key / f"fold_{fold_number:02d}",
             metadata={
-                "evaluation_domain": "source_validation",
+                "evaluation_domain": validation_domain,
                 "evaluation_role": "checkpoint_filter",
-                "baseline": "source_training_gene_mean",
-                "target_missing_truth_used_for_filtering": False,
+                "baseline": f"{training_domain}_training_gene_mean",
+                "target_missing_truth_used_for_filtering": target_training,
                 "evaluation_only_revalidation": True,
             },
             apply_quality_gate=True,
@@ -918,7 +950,7 @@ def reevaluate_source_flow_run(
             "target_transfer_spot_indices",
             checkpoint.get("performance_spot_indices"),
         )
-        if saved_target_indices is None:
+        if saved_target_indices is None and not target_training:
             target_generator = torch.Generator(device="cpu").manual_seed(
                 model_seed + 30_000 + fold_number
             )
@@ -931,7 +963,11 @@ def reevaluate_source_flow_run(
                 name="target_transfer_spot_indices",
                 upper_bound=len(fold_data.spatial_expression),
             )
-        target_performance = evaluate_flow_imputation(
+        if target_training and torch.isin(
+            target_transfer_indices, torch.cat((train_indices, validation_indices))
+        ).any():
+            raise ValueError("Saved target test indices overlap training or validation.")
+        report_performance = evaluate_flow_imputation(
             model,
             torch.as_tensor(
                 fold_data.spatial_expression[target_transfer_indices.numpy()]
@@ -957,12 +993,12 @@ def reevaluate_source_flow_run(
             max_relative_mse=max_validation_relative_mse,
             min_median_spcc=min_validation_spcc,
             output_dir=(
-                root / "target_transfer_performance" / f"fold_{fold_number:02d}"
+                root / report_key / f"fold_{fold_number:02d}"
             ),
             metadata={
-                "evaluation_domain": "target_spatial",
+                "evaluation_domain": report_domain,
                 "evaluation_role": "report_only",
-                "baseline": "source_training_gene_mean",
+                "baseline": f"{training_domain}_training_gene_mean",
                 "used_for_checkpoint_filtering": False,
                 "used_for_model_selection": False,
                 "used_as_adaptation_signal": False,
@@ -974,21 +1010,23 @@ def reevaluate_source_flow_run(
 
         legacy_performance = checkpoint.get("performance")
         if (
-            isinstance(legacy_performance, Mapping)
-            and not _is_source_only_performance(legacy_performance)
+            not target_training
+            and isinstance(legacy_performance, Mapping)
+            and not _is_validation_performance(legacy_performance, validation_domain)
             and "legacy_target_filter_performance" not in checkpoint
         ):
             checkpoint["legacy_target_filter_performance"] = dict(legacy_performance)
-        checkpoint["source_performance"] = source_performance
-        checkpoint["target_transfer_performance"] = target_performance
+        checkpoint[validation_key] = validation_performance
+        checkpoint[report_key] = report_performance
         checkpoint["target_transfer_spot_indices"] = target_transfer_indices
-        checkpoint["performance"] = source_performance
+        checkpoint["performance"] = validation_performance
         checkpoint["augment_source"] = augment_source
+        checkpoint["training_domain"] = training_domain
         checkpoint["training_status"] = "complete"
         checkpoint["evaluation_only_revalidation"] = {
             "weights_retrained": False,
             "optimizer_steps": 0,
-            "source_split": "saved_train_validation_indices",
+            f"{training_domain}_split": "saved_train_validation_indices",
             "legacy_target_performance_preserved": (
                 "legacy_target_filter_performance" in checkpoint
             ),
@@ -996,11 +1034,11 @@ def reevaluate_source_flow_run(
         _atomic_torch_save(checkpoint, checkpoint_path)
         _remove_latest_checkpoint(_latest_checkpoint_path(root, fold_number))
         processed_folds.append(fold_number)
-        if source_performance.get("passed") is not True:
+        if validation_performance.get("passed") is not True:
             failed_folds.append(fold_number)
 
-    all_source_performance: dict[str, dict[str, object]] = {}
-    all_target_performance: dict[str, dict[str, object]] = {}
+    all_validation_performance: dict[str, dict[str, object]] = {}
+    all_report_performance: dict[str, dict[str, object]] = {}
     remaining_unvalidated_folds: list[int] = []
     for record in fold_records:
         fold_number = int(record["fold"])
@@ -1009,23 +1047,24 @@ def reevaluate_source_flow_run(
             remaining_unvalidated_folds.append(fold_number)
             continue
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        source_performance = checkpoint.get("source_performance")
-        target_performance = checkpoint.get("target_transfer_performance")
-        if _is_source_only_performance(source_performance):
-            all_source_performance[f"fold_{fold_number:02d}"] = dict(source_performance)
+        if checkpoint.get("training_domain", "source") != training_domain:
+            raise ValueError(f"Checkpoint training domain mismatch: {checkpoint_path}")
+        validation_performance = checkpoint.get(validation_key)
+        report_performance = checkpoint.get(report_key)
+        if _is_validation_performance(validation_performance, validation_domain):
+            all_validation_performance[f"fold_{fold_number:02d}"] = dict(
+                validation_performance
+            )
         else:
             remaining_unvalidated_folds.append(fold_number)
-        if _is_target_report_only_performance(target_performance):
-            all_target_performance[f"fold_{fold_number:02d}"] = dict(target_performance)
+        if _is_report_only_performance(report_performance, report_domain):
+            all_report_performance[f"fold_{fold_number:02d}"] = dict(report_performance)
 
-    save_json(all_source_performance, root / "source_flow_performance.json")
-    save_json(
-        all_target_performance,
-        root / "target_transfer_performance.json",
-    )
+    save_json(all_validation_performance, root / f"{validation_summary}.json")
+    save_json(all_report_performance, root / f"{report_key}.json")
     algorithm_notes = experiment.setdefault("algorithm_notes", {})
-    algorithm_notes["checkpoint_filtering_domain"] = "source_validation"
-    algorithm_notes["target_transfer_evaluation"] = "report_only"
+    algorithm_notes["checkpoint_filtering_domain"] = validation_domain
+    algorithm_notes[f"{report_key.removesuffix('_performance')}_evaluation"] = "report_only"
     algorithm_notes["evaluation_only_revalidation_supported"] = True
     save_json(experiment, experiment_path)
     save_json(
@@ -1039,11 +1078,11 @@ def reevaluate_source_flow_run(
             "remaining_unvalidated_folds": remaining_unvalidated_folds,
             "force_evaluation": force_evaluation,
         },
-        root / "source_flow_revalidation.json",
+        root / f"{training_domain}_flow_revalidation.json",
     )
     if failed_folds and fail_on_performance:
         raise RuntimeError(
-            "Source-only checkpoint performance gate failed for folds "
+            f"{validation_domain} checkpoint performance gate failed for folds "
             f"{sorted(set(failed_folds))}; weights were not retrained."
         )
     return root
@@ -1064,7 +1103,7 @@ def train_source_flow_experiment(
     allow_existing: bool = False,
     resume: bool = False,
 ) -> Path:
-    """Train one or all source-flow folds without using ST targets in the loss."""
+    """Train one or all folds in the configured source or target domain."""
 
     try:
         from .Dataloader import (
@@ -1107,6 +1146,13 @@ def train_source_flow_experiment(
 
     configuration = settings or SourceFlowTrainSettings()
     configuration.validate()
+    training_domain = configuration.training_domain
+    target_training = training_domain == "target"
+    validation_domain = f"{training_domain}_validation"
+    validation_key = "target_validation_performance" if target_training else "source_performance"
+    report_domain = "target_test" if target_training else "target_spatial"
+    report_key = "target_test_performance" if target_training else "target_transfer_performance"
+    validation_summary = validation_key if target_training else "source_flow_performance"
     resolved_device = resolve_device(device)
     distributed = (
         dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
@@ -1214,8 +1260,8 @@ def train_source_flow_experiment(
 
     model_config = {
         "architecture": GENE_ATTENTION_ARCHITECTURE,
-        "input_size": int(prepared.seq_array.shape[1]),
-        "condition_size": int(prepared.seq_array.shape[1]),
+        "input_size": len(prepared.genes),
+        "condition_size": len(prepared.genes),
         "hidden_size": configuration.hidden_size,
         "depth": configuration.depth,
         "num_heads": configuration.num_heads,
@@ -1228,6 +1274,7 @@ def train_source_flow_experiment(
         "method": "source_flow",
         "preprocessing": GENE_LOCAL_PREPROCESSING,
         "augment_source": configuration.augment_source,
+        "training_domain": training_domain,
         "dataset": dataset_name,
         "output_dir": str(destination),
         "device": str(resolved_device),
@@ -1244,15 +1291,23 @@ def train_source_flow_experiment(
             "source_model_architecture": GENE_ATTENTION_ARCHITECTURE,
             "attention_axis": "genes_within_spot",
             "row_separable": True,
-            "training_samples": "source_scRNA_only",
-            "condition": "existing_fold_masked_source_expression",
-            "spatial_targets_used_for_training": False,
-            "checkpoint_filtering_domain": "source_validation",
-            "target_transfer_evaluation": "report_only",
+            "training_samples": (
+                "target_spatial_train" if target_training else "source_scRNA_only"
+            ),
+            "condition": f"existing_fold_masked_{training_domain}_expression",
+            "spatial_targets_used_for_training": target_training,
+            "checkpoint_filtering_domain": validation_domain,
+            f"{report_key.removesuffix('_performance')}_evaluation": "report_only",
             "numerical_training_contract": numerical_contract,
-            "checkpoint_selection": "best_source_validation_loss",
+            "checkpoint_selection": f"best_{training_domain}_validation_loss",
         },
     }
+    if target_training:
+        experiment["target_spot_split"] = {
+            "protocol": "random_60_20_20",
+            "seed": configuration.split_seed,
+            "shared_across_gene_folds": True,
+        }
     existing_experiment_path = destination / "experiment.json"
     existing_data_info_path = destination / "data_info.json"
     if primary and (allow_existing or resume) and existing_experiment_path.is_file():
@@ -1277,9 +1332,14 @@ def train_source_flow_experiment(
             and isinstance(existing_data_info, Mapping)
             and existing_experiment.get("method") == "source_flow"
             and existing_experiment.get("preprocessing") == GENE_LOCAL_PREPROCESSING
+            and existing_experiment.get("training_domain", "source") == training_domain
             and saved_augmentation == configuration.augment_source
             and isinstance(saved_settings, Mapping)
-            and {"augment_source": saved_augmentation, **saved_settings}
+            and {
+                "augment_source": saved_augmentation,
+                "training_domain": "source",
+                **saved_settings,
+            }
             == training_settings
             and existing_experiment.get("max_train_samples") == max_train_samples
             and existing_experiment.get("model") == model_config
@@ -1308,8 +1368,6 @@ def train_source_flow_experiment(
             temporary.replace(destination / name)
 
     all_history: list[dict[str, float]] = []
-    all_source_performance: dict[str, dict[str, object]] = {}
-    all_target_transfer_performance: dict[str, dict[str, object]] = {}
     failed_folds = []
     for current_fold in selected_folds:
         checkpoint_path = checkpoint_dir / f"fold_{current_fold.fold:02d}.pt"
@@ -1324,6 +1382,7 @@ def train_source_flow_experiment(
                     previous.get("method") != "source_flow"
                     or previous.get("fold") != current_fold.fold
                     or previous.get("augment_source", True) != configuration.augment_source
+                    or previous.get("training_domain", "source") != training_domain
                 ):
                     raise ValueError(f"Source-flow checkpoint mismatch: {checkpoint_path}")
                 status = previous.get("training_status", "complete")
@@ -1343,30 +1402,41 @@ def train_source_flow_experiment(
             continue
         set_seed(configuration.model_seed, deterministic=configuration.deterministic)
         fold_data = build_fold_data(prepared, current_fold, method="stdiff")
-        split_generator = torch.Generator(device="cpu").manual_seed(
-            configuration.model_seed + current_fold.fold
-        )
-        train_indices, validation_indices = _split_source_cells(
-            len(fold_data.train_expression),
-            configuration.validation_fraction,
-            generator=split_generator,
-            augment_source=configuration.augment_source,
-        )
+        if target_training:
+            domain_expression = fold_data.spatial_expression
+            domain_condition = fold_data.spatial_condition
+            domain_names = np.asarray(prepared.adata_spatial.obs_names)
+            train_indices, validation_indices, target_transfer_indices = split_target_spots(
+                len(domain_expression), seed=configuration.split_seed
+            )
+        else:
+            domain_expression = fold_data.train_expression
+            domain_condition = fold_data.train_condition
+            domain_names = np.asarray(prepared.adata_seq.obs_names)
+            split_generator = torch.Generator(device="cpu").manual_seed(
+                configuration.model_seed + current_fold.fold
+            )
+            train_indices, validation_indices = _split_source_cells(
+                len(domain_expression),
+                configuration.validation_fraction,
+                generator=split_generator,
+                augment_source=configuration.augment_source,
+            )
+            target_transfer_generator = torch.Generator(device="cpu").manual_seed(
+                configuration.model_seed + 30_000 + current_fold.fold
+            )
+            target_transfer_indices = torch.randperm(
+                len(fold_data.spatial_expression), generator=target_transfer_generator
+            )[: configuration.validation_max_samples]
         if max_train_samples is not None:
             if max_train_samples < 1:
                 raise ValueError("max_train_samples must be positive.")
             train_indices = train_indices[:max_train_samples]
         validation_indices = validation_indices[: configuration.validation_max_samples]
-        target_transfer_generator = torch.Generator(device="cpu").manual_seed(
-            configuration.model_seed + 30_000 + current_fold.fold
-        )
-        target_transfer_indices = torch.randperm(
-            len(fold_data.spatial_expression), generator=target_transfer_generator
-        )[: configuration.validation_max_samples]
-        train_expression = fold_data.train_expression[train_indices.numpy()]
-        train_condition = fold_data.train_condition[train_indices.numpy()]
-        validation_expression = fold_data.train_expression[validation_indices.numpy()]
-        validation_condition = fold_data.train_condition[validation_indices.numpy()]
+        train_expression = domain_expression[train_indices.numpy()]
+        train_condition = domain_condition[train_indices.numpy()]
+        validation_expression = domain_expression[validation_indices.numpy()]
+        validation_condition = domain_condition[validation_indices.numpy()]
         dataloader = get_data_loader(
             train_expression,
             train_condition,
@@ -1393,6 +1463,7 @@ def train_source_flow_experiment(
         checkpoint_metadata = {
             "preprocessing": GENE_LOCAL_PREPROCESSING,
             "augment_source": configuration.augment_source,
+            "training_domain": training_domain,
             "method": "source_flow",
             "flow_matching_contract": {
                 "version": 1,
@@ -1416,7 +1487,7 @@ def train_source_flow_experiment(
             "train_indices": train_indices,
             "validation_indices": validation_indices,
             "target_transfer_spot_indices": target_transfer_indices,
-            "checkpoint_selection": "best_source_validation_loss",
+            "checkpoint_selection": f"best_{training_domain}_validation_loss",
         }
 
         def persist_fold_history(
@@ -1478,16 +1549,14 @@ def train_source_flow_experiment(
         # evaluation process fails, --evaluation-only can finish this fold
         # without repeating training.
         _atomic_torch_save(checkpoint, checkpoint_path)
-        source_performance = evaluate_flow_imputation(
+        validation_performance = evaluate_flow_imputation(
             model,
             torch.as_tensor(validation_expression),
             torch.as_tensor(validation_condition),
             target_gene_indices=current_fold.test_indices,
             baseline_mean=torch.as_tensor(train_expression.mean(axis=0)),
             genes=prepared.genes.tolist(),
-            spot_names=np.asarray(prepared.adata_seq.obs_names)[
-                validation_indices.numpy()
-            ].tolist(),
+            spot_names=domain_names[validation_indices.numpy()].tolist(),
             validation_cfm_loss=selected_record["validation_flow_matching_loss"],
             device=resolved_device,
             batch_size=configuration.validation_batch_size,
@@ -1500,17 +1569,17 @@ def train_source_flow_experiment(
             max_relative_mse=configuration.max_validation_relative_mse,
             min_median_spcc=configuration.min_validation_spcc,
             output_dir=(
-                destination / "source_performance" / f"fold_{current_fold.fold:02d}"
+                destination / validation_key / f"fold_{current_fold.fold:02d}"
             ),
             metadata={
-                "evaluation_domain": "source_validation",
+                "evaluation_domain": validation_domain,
                 "evaluation_role": "checkpoint_filter",
-                "baseline": "source_training_gene_mean",
-                "target_missing_truth_used_for_filtering": False,
+                "baseline": f"{training_domain}_training_gene_mean",
+                "target_missing_truth_used_for_filtering": target_training,
             },
             apply_quality_gate=True,
         ).metrics
-        target_transfer_performance = evaluate_flow_imputation(
+        report_performance = evaluate_flow_imputation(
             model,
             torch.as_tensor(
                 fold_data.spatial_expression[target_transfer_indices.numpy()]
@@ -1537,13 +1606,13 @@ def train_source_flow_experiment(
             min_median_spcc=configuration.min_validation_spcc,
             output_dir=(
                 destination
-                / "target_transfer_performance"
+                / report_key
                 / f"fold_{current_fold.fold:02d}"
             ),
             metadata={
-                "evaluation_domain": "target_spatial",
+                "evaluation_domain": report_domain,
                 "evaluation_role": "report_only",
-                "baseline": "source_training_gene_mean",
+                "baseline": f"{training_domain}_training_gene_mean",
                 "used_for_checkpoint_filtering": False,
                 "used_for_model_selection": False,
                 "used_as_adaptation_signal": False,
@@ -1551,20 +1620,12 @@ def train_source_flow_experiment(
             },
             apply_quality_gate=False,
         ).metrics
-        all_source_performance[f"fold_{current_fold.fold:02d}"] = source_performance
-        all_target_transfer_performance[
-            f"fold_{current_fold.fold:02d}"
-        ] = target_transfer_performance
-        if not source_performance["passed"]:
-            failed_folds.append(current_fold.fold)
         checkpoint.update(
             {
                 "training_status": "complete",
-                "source_performance": source_performance,
-                "target_transfer_performance": target_transfer_performance,
-                # Backward-compatible alias.  Unlike legacy checkpoints, this is
-                # source-validation performance and is safe for filtering.
-                "performance": source_performance,
+                validation_key: validation_performance,
+                report_key: report_performance,
+                "performance": validation_performance,
             }
         )
         _atomic_torch_save(checkpoint, checkpoint_path)
@@ -1629,8 +1690,8 @@ def train_source_flow_experiment(
 
     # Rebuild summaries from every complete checkpoint so a targeted rerun
     # (for example, --fold 2 --allow-existing) does not erase fold 1 metadata.
-    all_source_performance = {}
-    all_target_transfer_performance = {}
+    all_validation_performance = {}
+    all_report_performance = {}
     failed_folds = []
     for fold_record in folds:
         fold_number = int(fold_record.fold)
@@ -1642,28 +1703,30 @@ def train_source_flow_experiment(
             map_location="cpu",
             weights_only=False,
         )
+        if saved_checkpoint.get("training_domain", "source") != training_domain:
+            raise ValueError(f"Checkpoint training domain mismatch: {saved_checkpoint_path}")
         if saved_checkpoint.get("training_status", "complete") != "complete":
             continue
-        source_record = saved_checkpoint.get("source_performance")
-        target_record = saved_checkpoint.get("target_transfer_performance")
+        validation_record = saved_checkpoint.get(validation_key)
+        report_record = saved_checkpoint.get(report_key)
         key = f"fold_{fold_number:02d}"
-        if _is_source_only_performance(source_record):
-            all_source_performance[key] = dict(source_record)
-            if source_record.get("passed") is not True:
+        if _is_validation_performance(validation_record, validation_domain):
+            all_validation_performance[key] = dict(validation_record)
+            if validation_record.get("passed") is not True:
                 failed_folds.append(fold_number)
-        if _is_target_report_only_performance(target_record):
-            all_target_transfer_performance[key] = dict(target_record)
+        if _is_report_only_performance(report_record, report_domain):
+            all_report_performance[key] = dict(report_record)
     save_json(
-        all_source_performance,
-        destination / "source_flow_performance.json",
+        all_validation_performance,
+        destination / f"{validation_summary}.json",
     )
     save_json(
-        all_target_transfer_performance,
-        destination / "target_transfer_performance.json",
+        all_report_performance,
+        destination / f"{report_key}.json",
     )
     if failed_folds and configuration.fail_on_performance:
         raise RuntimeError(
-            "Source-only checkpoint performance gate failed for folds "
+            f"{validation_domain} checkpoint performance gate failed for folds "
             f"{failed_folds}; downstream loading will reject these checkpoints."
         )
     return destination
@@ -1672,7 +1735,7 @@ def train_source_flow_experiment(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train row-separable per-spot gene-attention source "
+            "Train row-separable per-spot gene-attention conditional "
             "flow-matching models."
         )
     )
@@ -1681,6 +1744,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sc-path", default=None)
     parser.add_argument("--spatial-path", default=None)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--training-domain",
+        choices=("source", "target"),
+        default="source",
+        help="Train on scRNA or on the supervised ST training split (default: source).",
+    )
     parser.add_argument(
         "--device", default=None, help="Use --device cuda or omit it with torchrun."
     )
@@ -1722,7 +1791,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Train this fold and every later fold in the same run.",
     )
     parser.add_argument("--max-train-samples", type=int, default=None)
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        help="Source validation fraction. Target training uses fixed 60/20/20 splits.",
+    )
     parser.add_argument("--validation-batch-size", type=int, default=32)
     parser.add_argument("--validation-max-samples", type=int, default=512)
     parser.add_argument("--validation-num-noise-samples", type=int, default=4)
@@ -1732,7 +1806,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help=(
-            "Stop after this many epochs without a sufficient source-validation "
+            "Stop after this many epochs without a sufficient validation "
             "CFM-loss improvement and restore the best epoch; 0 disables it."
         ),
     )
@@ -1740,7 +1814,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--early-stopping-min-delta",
         type=float,
         default=0.0,
-        help="Minimum source-validation CFM-loss decrease counted as improvement.",
+        help="Minimum validation CFM-loss decrease counted as improvement.",
     )
     parser.add_argument("--max-validation-relative-mse", type=float, default=1.0)
     parser.add_argument("--min-validation-spcc", type=float, default=0.0)
@@ -1756,8 +1830,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--evaluation-only",
         action="store_true",
         help=(
-            "Load checkpoints from --output-dir and add source-only plus "
-            "target report-only evaluations without retraining."
+            "Load checkpoints from --output-dir and replay validation and "
+            "target reporting for the saved training domain without retraining."
         ),
     )
     parser.add_argument(
@@ -1816,6 +1890,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         learning_rate=args.learning_rate,
         noise_std=args.noise_std,
         augment_source=args.augment_source,
+        training_domain=args.training_domain,
         n_splits=args.n_splits,
         split_seed=args.split_seed,
         model_seed=args.model_seed,
@@ -1891,6 +1966,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "SourceFlowTrainSettings",
+    "split_target_spots",
     "train_one_source_flow_fold",
     "train_source_flow_experiment",
 ]

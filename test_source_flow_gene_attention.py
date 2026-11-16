@@ -358,5 +358,32 @@ class GeneLocalPreprocessingTests(unittest.TestCase):
         self.assertFalse(np.array_equal(old_a.spatial_array[:, 0], old_b.spatial_array[:, 0]))
 
 
+class FixedPathVelocityTests(unittest.TestCase):
+    def test_gauge_removes_rotation_and_retains_translation(self) -> None:
+        import numpy as np
+
+        try:
+            from .flow_path_comparison import _compare_time
+        except ImportError:
+            from flow_path_comparison import _compare_time
+
+        # Uniform angles give zero weak moments for the tangential rotation.
+        angles = np.linspace(0.0, 2.0 * np.pi, 128, endpoint=False)
+        points = np.column_stack((np.cos(angles), np.sin(angles)))
+        validation_angles = angles + np.pi / 128
+        validation = np.column_stack((np.cos(validation_angles), np.sin(validation_angles)))
+        states = np.concatenate((points, validation))
+        rotation = np.column_stack((-states[:, 1], states[:, 0]))
+        translation = np.broadcast_to([1.0, -2.0], states.shape)
+        no_waves = np.empty((0, 2))
+        result = _compare_time(
+            states, rotation, states, translation, len(points), no_waves, no_waves, 1e-9
+        )
+
+        self.assertAlmostEqual(result["half_squared_velocity_gap"], 2.5, places=7)
+        self.assertLess(result["source_weak_residual_rms"], 1e-8)
+        self.assertLess(result["target_weak_residual_rms"], 1e-8)
+
+
 if __name__ == "__main__":
     unittest.main()

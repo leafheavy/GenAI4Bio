@@ -275,9 +275,25 @@ class SourceFlowODESampler(nn.Module):
             raise ValueError("end_time must be greater than or equal to start_time.")
         if end_time == start_time:
             return initial_state
+        return self.integrate_trajectory(initial_state, condition, (start_time, end_time))[-1]
+
+    def integrate_trajectory(
+        self,
+        initial_state: torch.Tensor,
+        condition: torch.Tensor,
+        times: Sequence[float],
+    ) -> torch.Tensor:
+        """Integrate once and return the state at each requested time."""
+
+        if (
+            len(times) < 2
+            or not 0.0 <= times[0] < times[-1] <= 1.0
+            or any(not left < right for left, right in zip(times, times[1:]))
+        ):
+            raise ValueError("Trajectory times must be strictly increasing in [0, 1].")
         odeint = _require_torchdiffeq()
-        integration_times = torch.tensor(
-            [float(start_time), float(end_time)],
+        integration_times = torch.as_tensor(
+            times,
             device=initial_state.device,
             dtype=initial_state.dtype,
         )
@@ -293,8 +309,8 @@ class SourceFlowODESampler(nn.Module):
             "explicit_adams",
             "implicit_adams",
         }:
-            options = {"step_size": float(end_time - start_time) / self.num_steps}
-        trajectory = odeint(
+            options = {"step_size": float(times[-1] - times[0]) / self.num_steps}
+        return odeint(
             dynamics,
             initial_state,
             integration_times,
@@ -303,7 +319,6 @@ class SourceFlowODESampler(nn.Module):
             atol=self.atol,
             options=options,
         )
-        return trajectory[-1]
 
     def integrate_to(
         self,
@@ -421,6 +436,11 @@ def require_flow_performance(
         ):
             performance = legacy
     if not isinstance(performance, Mapping):
+        if performance_key != "source_performance":
+            raise FlowPerformanceError(
+                f"{label} has no {performance_key} metadata. "
+                "Re-evaluate this fold with source_flow_training.py --evaluation-only."
+            )
         raise FlowPerformanceError(
             f"{label} has no source-only checkpoint-filtering metadata. Retrain "
             "or re-evaluate it with the current source-flow script; legacy target-"
@@ -690,6 +710,8 @@ def load_source_flow_checkpoint(
     rtol: float = 1e-5,
     atol: float = 1e-5,
     require_row_separable: bool = False,
+    training_domain: str = "source",
+    require_validated_performance: bool = True,
 ) -> tuple[SourceFlowODESampler, SourceFlowModel, dict[str, Any]]:
     source = Path(checkpoint_path)
     if not source.is_file():
@@ -703,6 +725,10 @@ def load_source_flow_checkpoint(
 
     if checkpoint.get("method") != "source_flow":
         raise ValueError(f"Checkpoint is not a source_flow checkpoint: {source}")
+    if training_domain not in {"source", "target"}:
+        raise ValueError(f"Unknown flow training domain: {training_domain!r}.")
+    if checkpoint.get("training_domain", "source") != training_domain:
+        raise ValueError(f"Expected a {training_domain}-trained flow checkpoint: {source}.")
     training_status = checkpoint.get("training_status", "complete")
     if training_status == "training_in_progress":
         raise FlowPerformanceError(
@@ -741,15 +767,20 @@ def load_source_flow_checkpoint(
         raise ValueError(
             "This experiment requires a row-separable source-flow checkpoint, "
             f"but {source} uses {architecture!r}. Retrain it with the current "
-            "source_flow_training.py before running the CFM bound experiment."
+            "source_flow_training.py."
         )
 
-    source_performance = require_flow_performance(
-        checkpoint,
-        label=f"Source-flow checkpoint {source}",
-    )
-
-    checkpoint["source_performance"] = dict(source_performance)
+    if require_validated_performance:
+        performance_key = (
+            "source_performance" if training_domain == "source" else "target_validation_performance"
+        )
+        performance = require_flow_performance(
+            checkpoint,
+            label=f"{training_domain}-trained flow checkpoint {source}",
+            performance_key=performance_key,
+            expected_evaluation_domain=f"{training_domain}_validation",
+        )
+        checkpoint[performance_key] = dict(performance)
 
     model = build_source_flow_model(model_config).to(device)
 
@@ -808,6 +839,7 @@ def load_source_flow_run(
     ode_atol: float = 1e-5,
     require_row_separable: bool = False,
     require_observed_only_preprocessing: bool = False,
+    require_validated_performance: bool = True,
 ) -> LoadedSourceFlowRun:
     """Load one fold plus target ST data using the existing preprocessing path."""
 
@@ -892,6 +924,7 @@ def load_source_flow_run(
         rtol=ode_rtol,
         atol=ode_atol,
         require_row_separable=require_row_separable,
+        require_validated_performance=require_validated_performance,
     )
     if checkpoint.get("preprocessing", LEGACY_PREPROCESSING) != preprocessing:
         raise ValueError("Checkpoint preprocessing differs from experiment.json.")
