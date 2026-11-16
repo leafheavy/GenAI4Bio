@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
+import random
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -108,6 +111,117 @@ def _atomic_torch_save(payload: object, destination: str | Path) -> Path:
     return path
 
 
+_RUN_LOCK_NAME = ".source_flow.lock"
+_RESUME_SPLIT_FIELDS = (
+    "train_indices", "validation_indices", "target_transfer_spot_indices", "test_indices"
+)
+
+
+def _latest_checkpoint_path(run_dir: Path, fold: int) -> Path:
+    return run_dir / "training_checkpoints" / f"fold_{fold:02d}_latest.pt"
+
+
+def _remove_latest_checkpoint(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    try:
+        path.parent.rmdir()
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+            raise
+
+
+@contextmanager
+def _lock_run_directory(output_dir: str, *, create: bool = False):
+    """Allow only one Linux training or evaluation launcher to write a run."""
+    directory = Path(output_dir).expanduser().resolve()
+    if os.name != "posix" or (not create and not directory.is_dir()):
+        yield
+        return
+    import fcntl
+
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    # Keep the inode so concurrent launchers always lock the same file.
+    with (directory / _RUN_LOCK_NAME).open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f"Another process is writing this run: {directory}") from error
+        yield
+
+
+@dataclass(frozen=True)
+class _FoldCheckpoints:
+    latest: Path
+    best: Path
+    metadata: Mapping[str, Any]
+    resume: bool
+
+    def save_best(
+        self, weights: Mapping[str, torch.Tensor], epoch: int, validation_loss: float
+    ) -> None:
+        _atomic_torch_save(
+            {
+                **self.metadata,
+                "model_state_dict": weights,
+                "epoch": epoch,
+                "validation_cfm_loss": validation_loss,
+                "training_status": "training_in_progress",
+            },
+            self.best,
+        )
+
+    def load_latest(self) -> Optional[dict[str, Any]]:
+        if not self.resume or not self.latest.is_file():
+            return None
+        state = torch.load(self.latest, map_location="cpu", weights_only=False)
+        if state.get("version") != 1 or state.get("fold") != self.metadata["fold"]:
+            raise ValueError(f"Invalid source-flow training checkpoint: {self.latest}")
+        for field in _RESUME_SPLIT_FIELDS:
+            value = self.metadata[field]
+            if not np.array_equal(state["split"][field], value):
+                raise ValueError(f"Checkpoint split differs for {field}: {self.latest}")
+        return state
+
+
+def _epoch_rng_state(
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: Optional[torch.utils.data.DataLoader],
+) -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+        "train_loader": (
+            train_loader.generator.get_state() if train_loader.generator is not None else None
+        ),
+        "validation_loader": (
+            validation_loader.generator.get_state()
+            if validation_loader is not None and validation_loader.generator is not None
+            else None
+        ),
+    }
+
+
+def _restore_epoch_rng_state(
+    state: Mapping[str, Any],
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: Optional[torch.utils.data.DataLoader],
+) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if device.type == "cuda":
+        torch.cuda.set_rng_state(state["cuda"], device)
+    if train_loader.generator is not None:
+        train_loader.generator.set_state(state["train_loader"])
+    if validation_loader is not None and validation_loader.generator is not None:
+        validation_loader.generator.set_state(state["validation_loader"])
+
+
 @dataclass(frozen=True)
 class SourceFlowTrainSettings:
     batch_size: int = 512
@@ -184,20 +298,24 @@ def train_one_source_flow_fold(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     history_callback: Optional[Callable[[Sequence[Mapping[str, float]]], None]] = None,
+    checkpoints: Optional[_FoldCheckpoints] = None,
 ) -> tuple[list[dict[str, float]], torch.optim.Optimizer]:
     """Train straight-path conditional flow matching on source scRNA only."""
 
     model.to(device)
     model.train()
     distributed = isinstance(dataloader.sampler, DistributedSampler)
-    primary = not distributed or dist.get_rank() == 0
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    primary = rank == 0
+    select_best = bool(early_stopping_patience or checkpoints is not None)
 
     if early_stopping_patience < 0:
         raise ValueError("early_stopping_patience cannot be negative.")
     if early_stopping_min_delta < 0:
         raise ValueError("early_stopping_min_delta cannot be negative.")
-    if early_stopping_patience and validation_dataloader is None:
-        raise ValueError("Early stopping requires a validation DataLoader.")
+    if select_best and validation_dataloader is None:
+        raise ValueError("Selecting the best epoch requires a validation DataLoader.")
 
     amp_dtype = resolve_amp_dtype(device, amp_mode)
     use_amp = amp_dtype is not None
@@ -235,13 +353,45 @@ def train_one_source_flow_fold(
 
     history: list[dict[str, float]] = []
     best_validation_loss = float("inf")
+    patience_validation_loss = float("inf")
     best_model_state: dict[str, torch.Tensor] | None = None
     best_epoch = 0
     epochs_without_improvement = 0
+    if checkpoints is not None:
+        resume_state = checkpoints.load_latest()
+        if resume_state is not None:
+            history = resume_state["history"]
+            if (
+                len(resume_state["rank_rng"]) != world_size
+                or resume_state["device_type"] != device.type
+                or not 0 < resume_state["epoch"] == len(history) <= epochs
+            ):
+                raise ValueError(f"Incompatible training state: {checkpoints.latest}")
+            model.load_state_dict(resume_state["model_state_dict"])
+            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            scaler.load_state_dict(resume_state["scaler_state_dict"])
+            best_validation_loss = resume_state["best_validation_loss"]
+            patience_validation_loss = resume_state["patience_validation_loss"]
+            best_model_state = resume_state["best_model_state_dict"]
+            best_epoch = resume_state["best_epoch"]
+            epochs_without_improvement = resume_state["epochs_without_improvement"]
+            if primary:
+                # The latest snapshot is authoritative if shutdown occurred
+                # just before updating the public best checkpoint or JSON.
+                checkpoints.save_best(best_model_state, best_epoch, best_validation_loss)
+                print(f"Resumed {checkpoints.latest.name} after epoch {len(history)}.")
+            if history_callback is not None:
+                history_callback(history)
+            _restore_epoch_rng_state(
+                resume_state["rank_rng"][rank], device, dataloader, validation_dataloader
+            )
+            del resume_state
+    if early_stopping_patience and epochs_without_improvement >= early_stopping_patience:
+        epochs = len(history)
     iterator = (
-        tqdm(range(epochs), ncols=100, desc="train source flow")
+        tqdm(range(len(history), epochs), ncols=100, desc="train source flow")
         if show_progress
-        else range(epochs)
+        else range(len(history), epochs)
     )
     for epoch in iterator:
         if distributed:
@@ -323,6 +473,7 @@ def train_one_source_flow_fold(
             dist.all_reduce(reduced_loss)
             mean_loss = reduced_loss.item() / dist.get_world_size()
         record = {"epoch": float(epoch + 1), "flow_matching_loss": mean_loss}
+        best_improved = False
         if validation_dataloader is not None:
             validation_loss = 0.0
             if primary:
@@ -345,18 +496,54 @@ def train_one_source_flow_fold(
                 )
             record["validation_flow_matching_loss"] = validation_loss
 
+            if select_best and validation_loss < best_validation_loss:
+                best_validation_loss = validation_loss
+                best_model_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+                best_epoch = epoch + 1
+                best_improved = True
             if early_stopping_patience:
-                if validation_loss < (best_validation_loss - early_stopping_min_delta):
-                    best_validation_loss = validation_loss
-                    best_model_state = {
-                        name: value.detach().cpu().clone()
-                        for name, value in model.state_dict().items()
-                    }
-                    best_epoch = epoch + 1
+                if validation_loss < patience_validation_loss - early_stopping_min_delta:
+                    patience_validation_loss = validation_loss
                     epochs_without_improvement = 0
                 else:
                     epochs_without_improvement += 1
         history.append(record)
+        if checkpoints is not None:
+            local_rng = _epoch_rng_state(device, dataloader, validation_dataloader)
+            rank_rng = [None] * world_size if primary else None
+            if distributed:
+                dist.gather_object(local_rng, rank_rng, dst=0)
+            else:
+                rank_rng = [local_rng]
+            if primary:
+                _atomic_torch_save(
+                    {
+                        "version": 1,
+                        "fold": checkpoints.metadata["fold"],
+                        "split": {
+                            field: checkpoints.metadata[field]
+                            for field in _RESUME_SPLIT_FIELDS
+                        },
+                        "epoch": epoch + 1,
+                        "device_type": device.type,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "history": history,
+                        "best_model_state_dict": best_model_state,
+                        "best_validation_loss": best_validation_loss,
+                        "best_epoch": best_epoch,
+                        "patience_validation_loss": patience_validation_loss,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "rank_rng": rank_rng,
+                    },
+                    checkpoints.latest,
+                )
+                if best_improved:
+                    checkpoints.save_best(best_model_state, best_epoch, best_validation_loss)
         if history_callback is not None:
             history_callback(history)
         if show_progress:
@@ -372,9 +559,9 @@ def train_one_source_flow_fold(
         ):
             break
 
-    if early_stopping_patience:
+    if select_best:
         if best_model_state is None:
-            raise RuntimeError("Early stopping did not observe a valid checkpoint.")
+            raise RuntimeError("Training did not observe a valid validation checkpoint.")
         model.load_state_dict(best_model_state, strict=True)
         if best_epoch != len(history):
             # Adam moments belong to the last optimized epoch, not the restored
@@ -581,6 +768,8 @@ def reevaluate_source_flow_run(
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if checkpoint.get("method") != "source_flow":
             raise ValueError(f"Checkpoint is not source_flow: {checkpoint_path}")
+        if checkpoint.get("training_status") == "training_in_progress":
+            raise ValueError(f"Fold {fold_number} is unfinished. Continue with --resume.")
         if int(checkpoint.get("fold", -1)) != fold_number:
             raise ValueError(f"Checkpoint fold mismatch: {checkpoint_path}")
         if checkpoint.get("preprocessing", LEGACY_PREPROCESSING) != experiment.get(
@@ -598,6 +787,7 @@ def reevaluate_source_flow_run(
             and _is_target_report_only_performance(target_performance)
         ):
             skipped_folds.append(fold_number)
+            _remove_latest_checkpoint(_latest_checkpoint_path(root, fold_number))
             if source_performance.get("passed") is not True:
                 failed_folds.append(fold_number)
             print(
@@ -790,6 +980,7 @@ def reevaluate_source_flow_run(
             ),
         }
         _atomic_torch_save(checkpoint, checkpoint_path)
+        _remove_latest_checkpoint(_latest_checkpoint_path(root, fold_number))
         processed_folds.append(fold_number)
         if source_performance.get("passed") is not True:
             failed_folds.append(fold_number)
@@ -857,6 +1048,7 @@ def train_source_flow_experiment(
     start_fold: Optional[int] = None,
     max_train_samples: Optional[int] = None,
     allow_existing: bool = False,
+    resume: bool = False,
 ) -> Path:
     """Train one or all source-flow folds without using ST targets in the loss."""
 
@@ -951,11 +1143,14 @@ def train_source_flow_experiment(
                 f"validation batch {configuration.validation_batch_size}.",
                 flush=True,
             )
-    destination = (
-        ensure_output_dir(output_dir, allow_existing=allow_existing)
-        if primary
-        else Path(output_dir).expanduser().resolve()
-    )
+    destination = Path(output_dir).expanduser().resolve()
+    if primary:
+        if resume and not (destination / "experiment.json").is_file():
+            raise FileNotFoundError(f"--resume requires an existing run: {destination}")
+        has_only_lock = destination.is_dir() and all(
+            entry.name == _RUN_LOCK_NAME for entry in destination.iterdir()
+        )
+        ensure_output_dir(destination, allow_existing=allow_existing or resume or has_only_lock)
     checkpoint_dir = destination / "checkpoints"
     history_dir = destination / "training_history"
     sc_file, spatial_file, dataset_name = _resolve_input_paths(
@@ -1020,6 +1215,7 @@ def train_source_flow_experiment(
         "output_dir": str(destination),
         "device": str(resolved_device),
         "settings": asdict(configuration),
+        "max_train_samples": max_train_samples,
         "model": model_config,
         "environment": environment_snapshot() if primary else None,
         "numerical_training_contract": numerical_contract,
@@ -1037,16 +1233,12 @@ def train_source_flow_experiment(
             "checkpoint_filtering_domain": "source_validation",
             "target_transfer_evaluation": "report_only",
             "numerical_training_contract": numerical_contract,
-            "checkpoint_selection": (
-                "best_source_validation_loss"
-                if configuration.early_stopping_patience
-                else "last_epoch"
-            ),
+            "checkpoint_selection": "best_source_validation_loss",
         },
     }
     existing_experiment_path = destination / "experiment.json"
     existing_data_info_path = destination / "data_info.json"
-    if primary and allow_existing and existing_experiment_path.is_file():
+    if primary and (allow_existing or resume) and existing_experiment_path.is_file():
         existing_experiment = load_json(existing_experiment_path)
         existing_data_info = (
             load_json(existing_data_info_path)
@@ -1059,6 +1251,7 @@ def train_source_flow_experiment(
             and existing_experiment.get("method") == "source_flow"
             and existing_experiment.get("preprocessing") == GENE_LOCAL_PREPROCESSING
             and existing_experiment.get("settings") == asdict(configuration)
+            and existing_experiment.get("max_train_samples") == max_train_samples
             and existing_experiment.get("model") == model_config
             and existing_experiment.get("numerical_training_contract")
             == numerical_contract
@@ -1068,22 +1261,55 @@ def train_source_flow_experiment(
         )
         if not compatible:
             raise ValueError(
-                "--allow-existing cannot mix this run with artifacts created "
+                "Cannot reuse this output directory with artifacts created "
                 "under different data, model, training, or numerical settings. "
                 "Use a fresh --output-dir."
             )
     if primary:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         history_dir.mkdir(parents=True, exist_ok=True)
-        save_json(data_info, destination / "data_info.json")
-        save_json(fold_records(folds), destination / "gene_folds.json")
-        save_json(experiment, destination / "experiment.json")
+        for name, payload in (
+            ("data_info.json", data_info),
+            ("gene_folds.json", fold_records(folds)),
+            ("experiment.json", experiment),
+        ):
+            temporary = destination / f"{name}.tmp"
+            save_json(payload, temporary)
+            temporary.replace(destination / name)
 
     all_history: list[dict[str, float]] = []
     all_source_performance: dict[str, dict[str, object]] = {}
     all_target_transfer_performance: dict[str, dict[str, object]] = {}
     failed_folds = []
     for current_fold in selected_folds:
+        checkpoint_path = checkpoint_dir / f"fold_{current_fold.fold:02d}.pt"
+        latest_path = _latest_checkpoint_path(destination, current_fold.fold)
+        action = ["train"]
+        if primary:
+            if latest_path.is_file() and not resume:
+                raise FileExistsError(f"Training state exists: {latest_path}. Use --resume.")
+            if resume and checkpoint_path.is_file():
+                previous = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                if (
+                    previous.get("method") != "source_flow"
+                    or previous.get("fold") != current_fold.fold
+                ):
+                    raise ValueError(f"Source-flow checkpoint mismatch: {checkpoint_path}")
+                status = previous.get("training_status", "complete")
+                if status == "complete":
+                    action[0] = "skip"
+                    _remove_latest_checkpoint(latest_path)
+                    print(f"Fold {current_fold.fold}: already complete, skipping.")
+                elif status == "evaluation_pending" and not latest_path.is_file():
+                    raise ValueError(
+                        f"Fold {current_fold.fold} already has final weights. Run "
+                        f"--evaluation-only --fold {current_fold.fold}, then resume."
+                    )
+                del previous
+        if distributed:
+            dist.broadcast_object_list(action, src=0)
+        if action[0] == "skip":
+            continue
         set_seed(configuration.model_seed, deterministic=configuration.deterministic)
         fold_data = build_fold_data(prepared, current_fold, method="stdiff")
         split_generator = torch.Generator(device="cpu").manual_seed(
@@ -1132,6 +1358,33 @@ def train_source_flow_experiment(
             # and times on each rank. Fold and sampler seeds stay shared.
             torch.manual_seed(configuration.model_seed + rank)
         fold_history_path = history_dir / f"fold_{current_fold.fold:02d}.json"
+        checkpoint_metadata = {
+            "preprocessing": GENE_LOCAL_PREPROCESSING,
+            "method": "source_flow",
+            "flow_matching_contract": {
+                "version": 1,
+                "architecture": GENE_ATTENTION_ARCHITECTURE,
+                "row_separable": True,
+                "attention_axis": "genes_within_spot",
+                "base_distribution": "standard_normal",
+                "probability_path": "linear",
+                "path_schedule": "alpha_t=t,sigma_t=1-t",
+                "velocity_target": "z-x0",
+                "time_distribution": "uniform_[0,1)",
+            },
+            "numerical_training_contract": numerical_contract,
+            "fold": current_fold.fold,
+            "test_indices": current_fold.test_indices,
+            "test_genes": list(current_fold.test_genes),
+            "genes": prepared.genes.tolist(),
+            "mask": fold_data.mask,
+            "model_config": model_config,
+            "training_settings": asdict(configuration),
+            "train_indices": train_indices,
+            "validation_indices": validation_indices,
+            "target_transfer_spot_indices": target_transfer_indices,
+            "checkpoint_selection": "best_source_validation_loss",
+        }
 
         def persist_fold_history(
             records: Sequence[Mapping[str, float]],
@@ -1160,6 +1413,9 @@ def train_source_flow_experiment(
             early_stopping_patience=configuration.early_stopping_patience,
             early_stopping_min_delta=configuration.early_stopping_min_delta,
             history_callback=persist_fold_history if primary else None,
+            checkpoints=_FoldCheckpoints(
+                latest_path, checkpoint_path, checkpoint_metadata, resume
+            ),
         )
         if not primary:
             del model, optimizer
@@ -1175,46 +1431,15 @@ def train_source_flow_experiment(
         selected_record = selected_records[0]
         selected_epoch = int(selected_record["epoch"])
         stopped_epoch = int(history[-1]["epoch"])
-        checkpoint_path = checkpoint_dir / f"fold_{current_fold.fold:02d}.pt"
         checkpoint = {
+            **checkpoint_metadata,
             "model_state_dict": model.state_dict(),
-            "preprocessing": GENE_LOCAL_PREPROCESSING,
             "optimizer_state_dict": optimizer.state_dict(),
-            "optimizer_state_reset_after_best_restore": bool(
-                configuration.early_stopping_patience
-                and selected_epoch != stopped_epoch
-            ),
-            "method": "source_flow",
-            "flow_matching_contract": {
-                "version": 1,
-                "architecture": GENE_ATTENTION_ARCHITECTURE,
-                "row_separable": True,
-                "attention_axis": "genes_within_spot",
-                "base_distribution": "standard_normal",
-                "probability_path": "linear",
-                "path_schedule": "alpha_t=t,sigma_t=1-t",
-                "velocity_target": "z-x0",
-                "time_distribution": "uniform_[0,1)",
-            },
-            "numerical_training_contract": numerical_contract,
+            "optimizer_state_reset_after_best_restore": selected_epoch != stopped_epoch,
             "training_status": "evaluation_pending",
-            "fold": current_fold.fold,
-            "test_indices": current_fold.test_indices,
-            "test_genes": list(current_fold.test_genes),
-            "genes": prepared.genes.tolist(),
-            "mask": fold_data.mask,
-            "model_config": model_config,
-            "training_settings": asdict(configuration),
-            "train_indices": train_indices,
-            "validation_indices": validation_indices,
-            "target_transfer_spot_indices": target_transfer_indices,
             "epoch": selected_epoch,
+            "validation_cfm_loss": selected_record["validation_flow_matching_loss"],
             "training_stopped_epoch": stopped_epoch,
-            "checkpoint_selection": (
-                "best_source_validation_loss"
-                if configuration.early_stopping_patience
-                else "last_epoch"
-            ),
         }
         # Persist finite trained weights before ODE/metric evaluation.  If an
         # evaluation process fails, --evaluation-only can finish this fold
@@ -1310,6 +1535,7 @@ def train_source_flow_experiment(
             }
         )
         _atomic_torch_save(checkpoint, checkpoint_path)
+        _remove_latest_checkpoint(latest_path)
         del model, optimizer, checkpoint
         if distributed:
             dist.barrier()
@@ -1322,7 +1548,7 @@ def train_source_flow_experiment(
     try:
         import pandas as pd
 
-        if allow_existing and aggregate_history_path.is_file():
+        if (allow_existing or resume) and aggregate_history_path.is_file():
             existing_frame = pd.read_csv(aggregate_history_path)
             if "fold" in existing_frame:
                 for fold_number, frame in existing_frame.groupby("fold"):
@@ -1480,6 +1706,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--allow-existing", action="store_true")
     parser.add_argument(
+        "--resume", action="store_true",
+        help="Continue an existing run from the latest full epoch and skip complete folds.",
+    )
+    parser.add_argument(
         "--evaluation-only",
         action="store_true",
         help=(
@@ -1517,17 +1747,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.evaluation_only and args.start_fold is not None:
         raise ValueError("--start-fold is only available during training.")
     if args.evaluation_only:
+        if args.resume:
+            raise ValueError("--resume and --evaluation-only are mutually exclusive.")
         if distributed:
             raise ValueError("Run --evaluation-only with python on a single device.")
-        output = reevaluate_source_flow_run(
-            args.output_dir,
-            device=args.device,
-            fold=args.fold,
-            sc_path=args.sc_path,
-            spatial_path=args.spatial_path,
-            force_evaluation=args.force_evaluation,
-            fail_on_performance=not args.allow_failed_performance,
-        )
+        with _lock_run_directory(args.output_dir):
+            output = reevaluate_source_flow_run(
+                args.output_dir,
+                device=args.device,
+                fold=args.fold,
+                sc_path=args.sc_path,
+                spatial_path=args.spatial_path,
+                force_evaluation=args.force_evaluation,
+                fail_on_performance=not args.allow_failed_performance,
+            )
         print(output)
         return
     settings = SourceFlowTrainSettings(
@@ -1582,19 +1815,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
     # On failure let torchrun report the error and stop peers that may be
     # waiting in a collective. Explicitly tear down on a successful run.
-    output = train_source_flow_experiment(
-        output_dir=args.output_dir,
-        dataset=args.dataset,
-        data_root=args.data_root,
-        sc_path=args.sc_path,
-        spatial_path=args.spatial_path,
-        device=device,
-        settings=settings,
-        fold=args.fold,
-        start_fold=args.start_fold,
-        max_train_samples=args.max_train_samples,
-        allow_existing=args.allow_existing,
+    run_lock = (
+        _lock_run_directory(args.output_dir, create=not args.resume)
+        if not distributed or dist.get_rank() == 0
+        else nullcontext()
     )
+    with run_lock:
+        output = train_source_flow_experiment(
+            output_dir=args.output_dir,
+            dataset=args.dataset,
+            data_root=args.data_root,
+            sc_path=args.sc_path,
+            spatial_path=args.spatial_path,
+            device=device,
+            settings=settings,
+            fold=args.fold,
+            start_fold=args.start_fold,
+            max_train_samples=args.max_train_samples,
+            allow_existing=args.allow_existing,
+            resume=args.resume,
+        )
     if not distributed or dist.get_rank() == 0:
         print(output)
     if distributed:

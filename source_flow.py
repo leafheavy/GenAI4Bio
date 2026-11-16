@@ -703,7 +703,13 @@ def load_source_flow_checkpoint(
 
     if checkpoint.get("method") != "source_flow":
         raise ValueError(f"Checkpoint is not a source_flow checkpoint: {source}")
-    if checkpoint.get("training_status", "complete") != "complete":
+    training_status = checkpoint.get("training_status", "complete")
+    if training_status == "training_in_progress":
+        raise FlowPerformanceError(
+            f"Source-flow training is unfinished: {source}. "
+            "Run source_flow_training.py with --resume."
+        )
+    if training_status != "complete":
         raise FlowPerformanceError(
             f"Source-flow checkpoint evaluation is incomplete: {source}. "
             "Run source_flow_training.py with --evaluation-only for this fold."
