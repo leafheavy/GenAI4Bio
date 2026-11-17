@@ -54,6 +54,45 @@ class CalibrationRankEvaluation:
     mmd_bandwidth: float
 
 
+def _load_prepared_calibration(
+    args: argparse.Namespace, source, test_indices: np.ndarray
+) -> CalibrationRankEvaluation:
+    try:
+        from .prepare_observed_calibration import SharedTranslation
+    except ImportError:
+        from prepare_observed_calibration import SharedTranslation
+
+    root = Path(args.calibration_dir).expanduser()
+    metadata = load_json(root / "calibration.json")
+    source_info = load_json(Path(args.source_run_dir).expanduser().resolve() / "data_info.json")
+    observed_genes = [gene for gene, keep in zip(source.genes, source.observed_mask) if keep]
+    if (
+        metadata.get("method") != "shared_translation_v1"
+        or metadata.get("fold") != args.fold
+        or metadata.get("observed_genes") != observed_genes
+        or metadata.get("sc_sha256") != source_info["sc_sha256"]
+        or metadata.get("spatial_sha256") != source_info["spatial_sha256"]
+        or metadata.get("preprocessing") != source.checkpoint["preprocessing"]
+        or metadata.get("target_test_indices") != np.sort(test_indices).tolist()
+    ):
+        raise ValueError("Prepared calibration differs from the evaluation dataset, fold or held-out split.")
+    observed = np.load(root / "source_observed_test.npy", allow_pickle=False)
+    candidates = {item["name"]: SharedTranslation(float(item["delta"])) for item in metadata["candidates"]}
+    bandwidth = float(metadata["mmd_bandwidth"])
+    if (
+        not candidates or not all(np.isfinite(adapter.delta) for adapter in candidates.values())
+        or not np.isfinite(bandwidth) or bandwidth <= 0
+        or observed.shape != (len(metadata["source_test_indices"]), len(observed_genes))
+        or not np.isfinite(observed).all()
+    ):
+        raise ValueError("Invalid candidates, bandwidth or source observations in prepared calibration.")
+    return CalibrationRankEvaluation(
+        candidates=candidates,
+        source_observed=observed,
+        mmd_bandwidth=bandwidth,
+    )
+
+
 @dataclass(frozen=True)
 class PotentialBasis:
     """Gradients of linear, diagonal quadratic and Fourier potentials in a Euclidean chart."""
@@ -551,6 +590,9 @@ def run_comparison(
         )
         if not args.check_only:
             if output is None:
+                if getattr(args, "calibration_dir", None) is not None:
+                    rank_evaluation = _load_prepared_calibration(args, source, test_indices)
+                    rank_candidates = rank_evaluation.candidates
                 output = ensure_output_dir(args.output_dir)
             seed_rows, seed_candidate_losses, seed_endpoint_losses = _compare_seed(
                 args, source, target_sampler, test_indices, seed, calibration,
@@ -648,6 +690,7 @@ def main(
     parser.add_argument("--spatial-path")
     parser.add_argument("--check-only", action="store_true", help="Check prerequisite runs on CPU.")
     parser.add_argument("--output-dir")
+    parser.add_argument("--calibration-dir", help="Evaluate frozen candidates from prepare_observed_calibration.py.")
     parser.add_argument("--device")
     parser.add_argument("--max-spots", type=int, default=16)
     parser.add_argument("--num-times", type=int, default=5)
@@ -662,6 +705,8 @@ def main(
     args = parser.parse_args(argv)
     if not args.check_only and not args.output_dir:
         parser.error("--output-dir is required for evaluation.")
+    if args.calibration_dir and (args.check_only or calibration is not None or rank_evaluation is not None):
+        parser.error("--calibration-dir requires an evaluation with no Python-supplied adapters.")
     if min(args.fold, args.max_spots, args.num_times, args.batch_size, args.ode_steps) < 1:
         parser.error("Fold, spots, times, batch size and ODE steps must be positive.")
     if min(args.fit_samples, args.evaluation_samples) < 2 or args.rff_features < 0:
