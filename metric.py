@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Sequence
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+from scipy.spatial.distance import cdist
 from sklearn.metrics import (
     adjusted_mutual_info_score,
     adjusted_rand_score,
@@ -25,6 +26,66 @@ class MetricResult:
     gene_metrics: pd.DataFrame
     summary: pd.DataFrame
     clustering: pd.DataFrame | None = None
+
+
+def fixed_rbf_mmd_squared(
+    source: np.ndarray, target: np.ndarray, *, bandwidth: float
+) -> float:
+    """Biased MMD² for one preselected Gaussian bandwidth, including self pairs."""
+
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if (
+        source.ndim != 2 or target.ndim != 2
+        or source.size == 0 or target.size == 0
+        or source.shape[1] != target.shape[1]
+    ):
+        raise ValueError("MMD inputs must be nonempty matrices with the same feature dimension.")
+    if not (np.isfinite(source).all() and np.isfinite(target).all()):
+        raise ValueError("MMD inputs must be finite.")
+    if not np.isfinite(bandwidth) or bandwidth <= 0:
+        raise ValueError("MMD bandwidth must be positive and finite.")
+
+    def kernel_mean(left: np.ndarray, right: np.ndarray) -> float:
+        total = 0.0
+        # Kernel blocks bound memory while keeping every pair in the V-statistic.
+        block_size = 512
+        for start in range(0, len(left), block_size):
+            for end in range(0, len(right), block_size):
+                distances = cdist(left[start:start + block_size], right[end:end + block_size])
+                with np.errstate(over="ignore"):
+                    total += float(np.exp(-0.5 * (distances / bandwidth) ** 2).sum())
+        return total / (len(left) * len(right))
+
+    squared = kernel_mean(source, source) + kernel_mean(target, target) - 2 * kernel_mean(source, target)
+    return max(0.0, squared)  # Roundoff can make an exact zero slightly negative.
+
+
+def calibration_rank_correlations(delta_table: pd.DataFrame) -> dict:
+    """Summarize the two descriptive Spearman coefficients across candidates."""
+
+    delta_columns = ["delta_mmd_squared", "delta_path_loss", "delta_mse"]
+    if any(column not in delta_table for column in delta_columns):
+        raise ValueError(f"Expected one row per calibration candidate with columns {delta_columns}.")
+    deltas = delta_table[delta_columns].to_numpy(dtype=np.float64)
+    if not np.isfinite(deltas).all():
+        raise ValueError("Calibration score differences must be finite.")
+
+    coefficients: dict[str, float | None] = {}
+    undefined_reasons: dict[str, str] = {}
+    for index, column in enumerate(delta_columns[:2]):
+        key = f"spearman_{column}_vs_delta_mse"
+        left, right = deltas[:, index], deltas[:, 2]
+        if len(deltas) < 3:
+            reason = "fewer_than_three_candidates"
+        elif np.ptp(left) == 0 or np.ptp(right) == 0:
+            reason = "constant_delta"
+        else:
+            coefficients[key] = float(stats.spearmanr(left, right)[0])
+            continue
+        coefficients[key] = None
+        undefined_reasons[key] = reason
+    return {"n_candidates": len(deltas), "undefined_reasons": undefined_reasons, **coefficients}
 
 
 def _as_frame(
@@ -248,6 +309,8 @@ __all__ = [
     "MetricResult",
     "align_prediction",
     "cal_ssim",
+    "calibration_rank_correlations",
+    "fixed_rbf_mmd_squared",
     "clustering_metrics",
     "clustering_preservation",
     "evaluate_prediction",

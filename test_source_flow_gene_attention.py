@@ -6,9 +6,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+import pandas as pd
 import torch
 
 try:
+    from .metric import calibration_rank_correlations, fixed_rbf_mmd_squared
     from .source_flow import (
         GENE_ATTENTION_ARCHITECTURE,
         LEGACY_BATCH_ATTENTION_ARCHITECTURE,
@@ -23,6 +26,7 @@ try:
         GeneAttentionSourceFlowBackbone,
     )
 except ImportError:
+    from metric import calibration_rank_correlations, fixed_rbf_mmd_squared
     from source_flow import (
         GENE_ATTENTION_ARCHITECTURE,
         LEGACY_BATCH_ATTENTION_ARCHITECTURE,
@@ -383,6 +387,69 @@ class FixedPathVelocityTests(unittest.TestCase):
         self.assertAlmostEqual(result["half_squared_velocity_gap"], 2.5, places=7)
         self.assertLess(result["source_weak_residual_rms"], 1e-8)
         self.assertLess(result["target_weak_residual_rms"], 1e-8)
+
+    def test_calibrated_velocity_uses_the_baseline_comparison_points(self) -> None:
+        import numpy as np
+
+        try:
+            from .flow_path_comparison import _compare_time
+        except ImportError:
+            from flow_path_comparison import _compare_time
+
+        states = np.array([[-2.0], [-1.0], [1.0], [2.0]] * 2)
+        shifted_states = states + 10.0
+        no_waves = np.empty((0, 1))
+        scores = _compare_time(
+            states, states, states, np.zeros_like(states), 4, no_waves, no_waves, 1e-12,
+            calibrated_source=(shifted_states, shifted_states),
+        )
+
+        # Both source fields are u(x)=x. Moving the midpoint would change the score.
+        self.assertAlmostEqual(scores["half_squared_velocity_gap"], 1.25, places=7)
+        self.assertAlmostEqual(scores["calibrated_half_squared_velocity_gap"], 1.25, places=7)
+        self.assertAlmostEqual(scores["half_squared_velocity_gap_reduction"], 0.0, places=7)
+
+
+class CalibrationRankMetricTests(unittest.TestCase):
+    def test_endpoint_mse_averages_evaluation_draws_before_clipping(self) -> None:
+        try:
+            from .flow_path_comparison import _endpoint_mse
+        except ImportError:
+            from flow_path_comparison import _endpoint_mse
+
+        # The fit draw is excluded, and the two evaluation draws average to -1.
+        samples = np.array([[5.0], [-3.0], [1.0]])
+        self.assertEqual(_endpoint_mse(samples, np.array([0.0]), fit_samples=1), 0.0)
+
+    def test_mmd_keeps_diagonal_and_uses_the_requested_bandwidth(self) -> None:
+        source = np.array([[0.0]])
+        target = np.array([[2.0]])
+        self.assertAlmostEqual(
+            fixed_rbf_mmd_squared(source, target, bandwidth=2.0),
+            2 * (1 - np.exp(-0.5)),
+        )
+        self.assertEqual(fixed_rbf_mmd_squared(source + 2.0, target, bandwidth=2.0), 0.0)
+
+    def test_rank_coefficients_use_both_requested_deltas(self) -> None:
+        deltas = pd.DataFrame({
+            "delta_mmd_squared": [0.0, 0.3, 0.1],
+            "delta_path_loss": [-1.0, -4.0, -2.0],
+            "delta_mse": [-1.0, 3.0, 0.0],
+        })
+        result = calibration_rank_correlations(deltas)
+        mmd = "spearman_delta_mmd_squared_vs_delta_mse"
+        path = "spearman_delta_path_loss_vs_delta_mse"
+        self.assertAlmostEqual(result[mmd], 1.0)
+        self.assertAlmostEqual(result[path], -1.0)
+
+        two_candidates = calibration_rank_correlations(deltas.iloc[:2])
+        self.assertIsNone(two_candidates[mmd])
+        self.assertEqual(two_candidates["undefined_reasons"][mmd], "fewer_than_three_candidates")
+
+        constant_mmd = calibration_rank_correlations(deltas.assign(delta_mmd_squared=0.0))
+        self.assertIsNone(constant_mmd[mmd])
+        self.assertEqual(constant_mmd["undefined_reasons"][mmd], "constant_delta")
+        self.assertAlmostEqual(constant_mmd[path], -1.0)
 
 
 if __name__ == "__main__":
