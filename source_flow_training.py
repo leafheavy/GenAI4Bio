@@ -156,6 +156,7 @@ class _FoldCheckpoints:
     best: Path
     metadata: Mapping[str, Any]
     resume: bool
+    every: int = 1
 
     def save_best(
         self, weights: Mapping[str, torch.Tensor], epoch: int, validation_loss: float
@@ -398,6 +399,7 @@ def train_one_source_flow_fold(
             del resume_state
     if early_stopping_patience and epochs_without_improvement >= early_stopping_patience:
         epochs = len(history)
+    last_checkpoint_epoch = len(history)
     iterator = (
         tqdm(range(len(history), epochs), ncols=100, desc="train source flow")
         if show_progress
@@ -482,8 +484,8 @@ def train_one_source_flow_fold(
             reduced_loss = torch.tensor(mean_loss, device=device, dtype=torch.float64)
             dist.all_reduce(reduced_loss)
             mean_loss = reduced_loss.item() / dist.get_world_size()
-        record = {"epoch": float(epoch + 1), "flow_matching_loss": mean_loss}
-        best_improved = False
+        completed_epoch = epoch + 1
+        record = {"epoch": float(completed_epoch), "flow_matching_loss": mean_loss}
         if validation_dataloader is not None:
             validation_loss = 0.0
             if primary:
@@ -512,8 +514,7 @@ def train_one_source_flow_fold(
                     name: value.detach().cpu().clone()
                     for name, value in model.state_dict().items()
                 }
-                best_epoch = epoch + 1
-                best_improved = True
+                best_epoch = completed_epoch
             if early_stopping_patience:
                 if validation_loss < patience_validation_loss - early_stopping_min_delta:
                     patience_validation_loss = validation_loss
@@ -521,7 +522,15 @@ def train_one_source_flow_fold(
                 else:
                     epochs_without_improvement += 1
         history.append(record)
-        if checkpoints is not None:
+        stop_early = (
+            early_stopping_patience > 0
+            and epochs_without_improvement >= early_stopping_patience
+        )
+        if checkpoints is not None and (
+            completed_epoch % checkpoints.every == 0
+            or completed_epoch == epochs
+            or stop_early
+        ):
             local_rng = _epoch_rng_state(device, dataloader, validation_dataloader)
             rank_rng = [None] * world_size if primary else None
             if distributed:
@@ -539,7 +548,7 @@ def train_one_source_flow_fold(
                             field: checkpoints.metadata[field]
                             for field in _RESUME_SPLIT_FIELDS
                         },
-                        "epoch": epoch + 1,
+                        "epoch": completed_epoch,
                         "device_type": device.type,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -554,8 +563,10 @@ def train_one_source_flow_fold(
                     },
                     checkpoints.latest,
                 )
-                if best_improved:
+                # The best epoch can fall between two checkpoint writes.
+                if best_epoch > last_checkpoint_epoch:
                     checkpoints.save_best(best_model_state, best_epoch, best_validation_loss)
+            last_checkpoint_epoch = completed_epoch
         if history_callback is not None:
             history_callback(history)
         if show_progress:
@@ -565,10 +576,7 @@ def train_one_source_flow_fold(
                 else f", val:{record['validation_flow_matching_loss']:.6f}"
             )
             iterator.set_postfix_str(f"cfm loss:{mean_loss:.6f}{validation_text}")
-        if (
-            early_stopping_patience
-            and epochs_without_improvement >= early_stopping_patience
-        ):
+        if stop_early:
             break
 
     if select_best:
@@ -1102,8 +1110,12 @@ def train_source_flow_experiment(
     max_train_samples: Optional[int] = None,
     allow_existing: bool = False,
     resume: bool = False,
+    checkpoint_every: int = 1,
 ) -> Path:
     """Train one or all folds in the configured source or target domain."""
+
+    if not isinstance(checkpoint_every, int) or checkpoint_every < 1:
+        raise ValueError("checkpoint_every must be a positive integer.")
 
     try:
         from .Dataloader import (
@@ -1279,6 +1291,8 @@ def train_source_flow_experiment(
         "output_dir": str(destination),
         "device": str(resolved_device),
         "settings": training_settings,
+        # The save interval can change when resuming the same experiment.
+        "checkpoint_every": checkpoint_every,
         "max_train_samples": max_train_samples,
         "model": model_config,
         "environment": environment_snapshot() if primary else None,
@@ -1518,7 +1532,8 @@ def train_source_flow_experiment(
             early_stopping_min_delta=configuration.early_stopping_min_delta,
             history_callback=persist_fold_history if primary else None,
             checkpoints=_FoldCheckpoints(
-                latest_path, checkpoint_path, checkpoint_metadata, resume
+                latest_path, checkpoint_path, checkpoint_metadata, resume,
+                every=checkpoint_every,
             ),
         )
         if not primary:
@@ -1765,6 +1780,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--epochs", type=int, default=900)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        metavar="EPOCHS",
+        help=(
+            "Save a resumable checkpoint every N epochs (default: 1) and when "
+            "training ends, including early stopping. Can be changed with --resume."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument(
         "--augment-source",
@@ -1824,7 +1849,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-existing", action="store_true")
     parser.add_argument(
         "--resume", action="store_true",
-        help="Continue an existing run from the latest full epoch and skip complete folds.",
+        help="Continue an existing run from the latest saved epoch and skip complete folds.",
     )
     parser.add_argument(
         "--evaluation-only",
@@ -1953,6 +1978,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             max_train_samples=args.max_train_samples,
             allow_existing=args.allow_existing,
             resume=args.resume,
+            checkpoint_every=args.checkpoint_every,
         )
     if not distributed or dist.get_rank() == 0:
         print(output)
