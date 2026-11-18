@@ -655,9 +655,9 @@ def _plot_velocity_fields(
             figure.suptitle(f"Velocity fields at shared probes (fold {fold}, ST spot {spot})")
             figure.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
             figure.tight_layout(rect=(0, 0.06, 1, 0.95))
-            temporary = destination.with_suffix(".pdf.tmp")
+            temporary = destination.with_suffix(".png.tmp")
             try:
-                figure.savefig(temporary, format="pdf")
+                figure.savefig(temporary, format="png", dpi=220)
                 temporary.replace(destination)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -812,7 +812,7 @@ def run_comparison(
     if args.check_only:
         return
     if plot_velocity:
-        destination = output / f"velocity_fold{args.fold:02d}_spot{plotted_spot}.pdf"
+        destination = output / f"velocity_fold{args.fold:02d}_spot{plotted_spot}.png"
         _plot_velocity_fields(
             velocity_by_seed, fold=args.fold, spot=plotted_spot,
             max_arrows=args.velocity_arrows, destination=destination,
@@ -914,7 +914,7 @@ def main(
     parser.add_argument("--correlation-split-seed", type=int, default=0)
     parser.add_argument(
         "--plot-velocity", action="store_true",
-        help="Write a PDF of the source and target velocities at shared identity midpoints.",
+        help="Write a PNG of the source and target velocities at shared identity midpoints.",
     )
     parser.add_argument("--velocity-spot", type=int, help="Sampled ST row index (default: first sampled row).")
     parser.add_argument("--velocity-arrows", type=int, default=8, help="Maximum arrow pairs per panel.")
