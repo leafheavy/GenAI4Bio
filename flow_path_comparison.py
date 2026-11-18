@@ -60,6 +60,8 @@ class VelocitySlice:
     midpoint: np.ndarray
     source: np.ndarray
     target: np.ndarray
+    w2_squared_per_gene: float
+    squared_velocity_gap_per_gene: float
 
 
 def _load_prepared_calibration(
@@ -167,19 +169,23 @@ def _path_samples(
         condition = condition.clone()
         condition[observed] = source_observed
 
+    integration_times = (0.0, *times)
+    if integration_times[-1] != 1.0:
+        integration_times += (1.0,)
+
     states, velocities, endpoints = [], [], []
     for noise_batch in noise.split(batch_size):
         batch_condition = condition.expand(noise_batch.shape[0], -1)
         path = sampler.integrate_trajectory(
-            noise_batch.to(condition.device), batch_condition, (0.0, *times, 1.0)
+            noise_batch.to(condition.device), batch_condition, integration_times
         )[1:]
         # The missing marginal inherits the missing component of the actual ODE derivative.
         velocity = torch.stack([
             sampler.vector_field(state, state.new_tensor(time), batch_condition)[:, missing]
-            for time, state in zip(times, path[:-1])
+            for time, state in zip(times, path)
         ])
         if not include_endpoint:
-            path = path[:-1]
+            path = path[:len(times)]
         if calibration is not None:
             # The sampler evolves the full state, but the compared path lives
             # on the conditional fibre with the observed coordinates fixed.
@@ -202,8 +208,7 @@ def _path_samples(
             velocity = target_velocity.reshape_as(path)[:len(times), :, missing]
         if include_endpoint:
             endpoints.append(path[-1, :, missing].cpu().numpy())
-            path = path[:-1]
-        states.append(path[:, :, missing].cpu().numpy())
+        states.append(path[:len(times), :, missing].cpu().numpy())
         velocities.append(velocity.cpu().numpy())
     state_array = np.concatenate(states, axis=1).astype(np.float64)
     velocity_array = np.concatenate(velocities, axis=1).astype(np.float64)
@@ -383,7 +388,8 @@ def _compare_time_and_candidates(
     velocity_slice = None
     if capture_velocity:
         velocity_slice = VelocitySlice(
-            midpoint, basis.velocity(midpoint, source_coef), basis.velocity(midpoint, target_coef)
+            midpoint, basis.velocity(midpoint, source_coef), basis.velocity(midpoint, target_coef),
+            scores["w2_squared_per_gene"], scores["squared_velocity_gap_per_gene"],
         )
     return scores, candidate_losses, velocity_slice
 
@@ -446,7 +452,7 @@ def _compare_seed(
         plot_spot = int(spots[0]) if args.velocity_spot is None else args.velocity_spot
         if plot_spot not in spots:
             raise ValueError(f"Velocity plot spot {plot_spot} is not among the sampled ST test spots.")
-    plot_times = {0, len(times) // 2, len(times) - 1}
+        times.append(1.0)
     rows = []
     candidate_path_loss = dict.fromkeys(rank_candidates, 0.0)
     baseline_mse = 0.0
@@ -485,8 +491,6 @@ def _compare_seed(
             for name, samples in candidate_samples.items():
                 candidate_mse[name] += _endpoint_mse(samples[2], truth, args.fit_samples)
         for time_index, time in enumerate(times):
-            if velocity_slices is not None and time_index not in plot_times:
-                continue
             calibrated_source = (
                 None if calibration is None else
                 (calibrated_states[time_index], calibrated_velocity[time_index])
@@ -579,11 +583,23 @@ def _plot_velocity_fields(
     destination: Path,
 ) -> None:
     from matplotlib import pyplot as plt
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
     from sklearn.decomposition import PCA
 
     seeds = sorted(slices_by_seed)
     times = sorted(slices_by_seed[seeds[0]])
+    time_means = {
+        time: (
+            np.mean([slices_by_seed[seed][time].w2_squared_per_gene for seed in seeds]),
+            np.mean([slices_by_seed[seed][time].squared_velocity_gap_per_gene for seed in seeds]),
+        )
+        for time in times
+    }
+
+    def shift_label(state_gap: float, velocity_gap: float) -> str:
+        return rf"$W_2^2/d={state_gap:.3g},\ L_v={velocity_gap:.3g}$"
+
     points = np.concatenate([slices_by_seed[seed][time].midpoint for seed in seeds for time in times])
     pca = PCA(n_components=2, svd_solver="full").fit(points)
     projected = pca.transform(points)
@@ -616,6 +632,8 @@ def _plot_velocity_fields(
     limits = np.stack((projected.min(axis=0) - 0.24 * span, projected.max(axis=0) + 0.24 * span))
     source_color = "#4B5563"
     target_colors = ("#D9E7F4", "#FFC7CE", "#FFF9D9")
+    midpoint_color = "#BFC7D0"
+    anchor_color = "#374151"
     with plt.rc_context({
         "text.usetex": True,
         "text.latex.preamble": r"\usepackage{amsmath}",
@@ -630,19 +648,24 @@ def _plot_velocity_fields(
                 for column, time in enumerate(times):
                     axis = axes[row, column]
                     base, anchors, source, target = panels[row * len(times) + column]
-                    axis.scatter(*base.T, s=5, color="#CDD3DA", linewidths=0)
+                    axis.scatter(*base.T, s=5, color=midpoint_color, linewidths=0)
                     for velocity, color, width in (
-                        (source, source_color, 0.010), (target, target_colors[row], 0.007),
+                        (source, source_color, 0.0045), (target, target_colors[row], 0.0035),
                     ):
                         axis.quiver(
                             *anchors.T, *(velocity * length_scale).T,
                             angles="xy", scale_units="xy", scale=1, pivot="tail", width=width,
-                            color=color, edgecolor="#374151", linewidth=0.45,
+                            color=color, edgecolor=anchor_color, linewidth=0.2,
                         )
-                    axis.scatter(*anchors.T, s=9, color="#374151", linewidths=0, zorder=4)
+                    axis.scatter(*anchors.T, s=6, color=anchor_color, linewidths=0, zorder=4)
                     axis.set(xlim=limits[:, 0], ylim=limits[:, 1], aspect="equal")
+                    item = slices_by_seed[seed][time]
+                    axis.text(
+                        0.03, 0.97, shift_label(item.w2_squared_per_gene, item.squared_velocity_gap_per_gene),
+                        transform=axis.transAxes, va="top", fontsize=8,
+                    )
                     if row == 0:
-                        axis.set_title(fr"$t={time:.3g}$")
+                        axis.set_title(fr"$t={time:.4g}$" + "\nSeed mean " + shift_label(*time_means[time]), fontsize=9)
                     if column == 0:
                         axis.set_ylabel(f"Target {seed}\nPC 2")
                     if row == len(seeds) - 1:
@@ -652,9 +675,17 @@ def _plot_velocity_fields(
                 Patch(facecolor=color, edgecolor="#374151", label=f"Target {seed}")
                 for seed, color in zip(seeds, target_colors)
             )
+            handles.extend([
+                Line2D([], [], linestyle="none", marker="o", markersize=4,
+                       color=midpoint_color, label="Wasserstein midpoints"),
+                Line2D([], [], linestyle="none", marker="o", markersize=4,
+                       color=anchor_color, label="Arrow anchors"),
+            ])
             figure.suptitle(f"Velocity fields at shared probes (fold {fold}, ST spot {spot})")
-            figure.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
-            figure.tight_layout(rect=(0, 0.06, 1, 0.95))
+            legend_columns = min(len(handles), max(2, len(times)))
+            legend_rows = (len(handles) + legend_columns - 1) // legend_columns
+            figure.legend(handles=handles, loc="lower center", ncol=legend_columns, frameon=False)
+            figure.tight_layout(rect=(0, (0.25 + 0.30 * legend_rows) / figure.get_figheight(), 1, 0.95))
             temporary = destination.with_suffix(".png.tmp")
             try:
                 figure.savefig(temporary, format="png", dpi=220)
@@ -914,7 +945,7 @@ def main(
     parser.add_argument("--correlation-split-seed", type=int, default=0)
     parser.add_argument(
         "--plot-velocity", action="store_true",
-        help="Write a PNG of the source and target velocities at shared identity midpoints.",
+        help="Plot velocities at shared identity midpoints for every evaluation time and t=1.",
     )
     parser.add_argument("--velocity-spot", type=int, help="Sampled ST row index (default: first sampled row).")
     parser.add_argument("--velocity-arrows", type=int, default=8, help="Maximum arrow pairs per panel.")
