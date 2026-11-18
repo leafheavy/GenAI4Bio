@@ -234,6 +234,14 @@ def _target_partitions(checkpoint: dict, num_spots: int) -> list[np.ndarray]:
     return partitions
 
 
+def _load_target_checkpoint(args: argparse.Namespace, run_dir: Path, device: torch.device):
+    return load_source_flow_checkpoint(
+        str(run_dir / "checkpoints" / f"fold_{args.fold:02d}.pt"),
+        device=device, num_steps=args.ode_steps, require_row_separable=True,
+        training_domain="target", require_validated_performance=not args.allow_failed_performance,
+    )
+
+
 def _load_pairs(args: argparse.Namespace, device: torch.device):
     source_dir = Path(args.source_run_dir).expanduser().resolve()
     target_runs = args.target_run_dir
@@ -282,11 +290,7 @@ def _load_pairs(args: argparse.Namespace, device: torch.device):
         target_info = load_json(target_dir / "data_info.json")
         if source_info["spatial_sha256"] != target_info["spatial_sha256"]:
             raise ValueError("All runs must reference the same ST benchmark and spot order.")
-        target_sampler, _, target = load_source_flow_checkpoint(
-            str(target_dir / "checkpoints" / checkpoint_name), device=device, num_steps=args.ode_steps,
-            require_row_separable=True, training_domain="target",
-            require_validated_performance=not args.allow_failed_performance,
-        )
+        target_sampler, _, target = _load_target_checkpoint(args, target_dir, device)
         target_contract = target.get("flow_matching_contract")
         compatible_cfm = legacy_cfm if source_contract is None else source_contract == target_contract
         if (
@@ -419,9 +423,13 @@ def _compare_seed(
     score_endpoints: bool,
     *,
     velocity_slices: dict[float, VelocitySlice] | None = None,
+    reference_sampler: SourceFlowODESampler | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float], tuple[float, dict[str, float]] | None]:
     random = np.random.default_rng(args.seed)
-    spots = np.sort(random.choice(test_indices, size=min(args.max_spots, len(test_indices)), replace=False))
+    spot_count = min(args.max_spots or len(test_indices), len(test_indices))
+    spots = np.sort(random.choice(test_indices, size=spot_count, replace=False))
+    if reference_sampler is None:
+        reference_sampler = source.sampler
     device = source.target_expression.device
     observed = source.observed_mask.to(device)
     missing = source.missing_mask.to(device)
@@ -451,7 +459,7 @@ def _compare_seed(
             # Advance the same noise stream as the numeric comparison.
             continue
         source_samples = _path_samples(
-            source.sampler, condition, missing, noise, times, args.batch_size,
+            reference_sampler, condition, missing, noise, times, args.batch_size,
             include_endpoint=score_endpoints,
         )
         source_states, source_velocity = source_samples[:2]
@@ -510,6 +518,56 @@ def _compare_seed(
             {name: loss / len(spots) for name, loss in candidate_mse.items()},
         )
     return rows, {name: loss / len(rows) for name, loss in candidate_path_loss.items()}, endpoint_losses
+
+
+def _compare_target_seeds(args, source, test_indices, targets, device) -> pd.DataFrame:
+    seeds = sorted(targets)
+    source.sampler.cpu()
+    rows = []
+    # Replay one unordered pair at a time. _compare_seed resets the evaluation RNGs,
+    # so the spots, noise, and random basis directions match the source comparisons.
+    for index, left in enumerate(seeds[:-1]):
+        left_sampler = _load_target_checkpoint(args, Path(targets[left]["target_run_dir"]), device)[0]
+        for right in seeds[index + 1:]:
+            right_sampler = _load_target_checkpoint(args, Path(targets[right]["target_run_dir"]), device)[0]
+            print(f"Comparing target seeds {left} and {right} on fold {args.fold}.", flush=True)
+            pair_rows, _, _ = _compare_seed(
+                args, source, right_sampler, test_indices, right, None, {}, False,
+                reference_sampler=left_sampler,
+            )
+            for row in pair_rows:
+                row["target_seed_left"] = left
+            rows.extend(pair_rows)
+            del right_sampler
+        del left_sampler
+    metrics = pd.DataFrame(rows).rename(columns={
+        "target_seed": "target_seed_right",
+        "source_weak_residual_rms": "left_weak_residual_rms",
+        "target_weak_residual_rms": "right_weak_residual_rms",
+    })
+    keys = ["spot_index", "spot", "time", "target_seed_left", "target_seed_right"]
+    return metrics[keys + list(metrics.columns.difference(keys))]
+
+
+def _target_seed_control_summary(source_target: pd.DataFrame, target_target: pd.DataFrame) -> dict:
+    columns = ["half_squared_velocity_gap", "squared_velocity_gap_per_gene", "w2_squared_per_gene"]
+    source_by_time = source_target.groupby("time")[columns].mean()
+    target_by_time = target_target.groupby("time")[columns].mean()
+    return {
+        "evaluated_spots": int(target_target["spot_index"].nunique()),
+        "by_target_seed_pair": target_target.groupby(
+            ["target_seed_left", "target_seed_right"], as_index=False
+        )[columns].mean().to_dict("records"),
+        "by_time": [
+            {
+                "time": time,
+                "source_target_mean": scores.to_dict(),
+                "target_target_mean": target_by_time.loc[time].to_dict(),
+                "source_target_minus_target_target": (scores - target_by_time.loc[time]).to_dict(),
+            }
+            for time, scores in source_by_time.iterrows()
+        ],
+    }
 
 
 def _plot_velocity_fields(
@@ -763,6 +821,9 @@ def run_comparison(
         return
 
     metrics = pd.DataFrame(rows)
+    target_control = None
+    if getattr(args, "target_target_control", False):
+        target_control = _compare_target_seeds(args, source, test_indices, targets, device)
     score_columns = metrics.columns[4:].tolist()
     primary_metric = "half_squared_velocity_gap"
     seed_scores = [primary_metric]
@@ -780,6 +841,9 @@ def run_comparison(
         rank_scores.to_csv(output / "calibration_rank_scores.csv", index=False)
         save_json(rank_summary, output / "calibration_rank_summary.json")
     metrics.to_csv(output / "path_comparison.csv", index=False)
+    if target_control is not None:
+        target_control.to_csv(output / "target_target_path_comparison.csv", index=False)
+        save_json(_target_seed_control_summary(metrics, target_control), output / "target_target_summary.json")
     save_json({
         "measure": "fixed_path_minimum_kinetic_velocity_gap",
         "primary_metric": primary_metric,
@@ -827,9 +891,9 @@ def main(
     rank_evaluation: CalibrationRankEvaluation | None = None,
 ) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-run-dir", required=True)
+    parser.add_argument("--source-run-dir")
     parser.add_argument(
-        "--target-run-dir", action="append", required=True,
+        "--target-run-dir", action="append",
         help="Target flow run. Repeat the flag to compare multiple target training seeds.",
     )
     parser.add_argument("--fold", type=int, default=1)
@@ -839,13 +903,23 @@ def main(
     parser.add_argument("--output-dir")
     parser.add_argument("--calibration-dir", help="Evaluate frozen candidates from prepare_observed_calibration.py.")
     parser.add_argument(
+        "--target-target-control", action="store_true",
+        help="Also compare all unordered pairs of target seeds on the same evaluation grid and noise.",
+    )
+    parser.add_argument(
+        "--statistic-correlation-dataset", "--statistic_correlation_dataset", nargs="+", metavar="DATASET",
+        help="Summarize rank correlations from saved calibration scores for these datasets.",
+    )
+    parser.add_argument("--correlation-root", default="./results/calibration_ranking")
+    parser.add_argument("--correlation-split-seed", type=int, default=0)
+    parser.add_argument(
         "--plot-velocity", action="store_true",
         help="Write a PDF of the source and target velocities at shared identity midpoints.",
     )
     parser.add_argument("--velocity-spot", type=int, help="Sampled ST row index (default: first sampled row).")
     parser.add_argument("--velocity-arrows", type=int, default=8, help="Maximum arrow pairs per panel.")
     parser.add_argument("--device")
-    parser.add_argument("--max-spots", type=int, default=16)
+    parser.add_argument("--max-spots", type=int, default=16, help="Max held-out ST spots (0: all test spots).")
     parser.add_argument("--num-times", type=int, default=5)
     parser.add_argument("--fit-samples", type=int, default=128)
     parser.add_argument("--evaluation-samples", type=int, default=128)
@@ -856,10 +930,36 @@ def main(
     parser.add_argument("--seed", type=int, default=1202)
     parser.add_argument("--allow-failed-performance", action="store_true", help="Allow diagnostic use of completed checkpoints below their validation thresholds.")
     args = parser.parse_args(argv)
+    if args.statistic_correlation_dataset:
+        if (
+            args.source_run_dir or args.target_run_dir or args.calibration_dir or args.check_only
+            or args.plot_velocity or args.target_target_control or calibration is not None
+            or rank_evaluation is not None
+        ):
+            parser.error("Dataset correlation summaries read saved results and run separately from flow evaluation.")
+        if not args.output_dir or args.correlation_split_seed < 0:
+            parser.error("Dataset correlation summaries require --output-dir and a nonnegative split seed.")
+        try:
+            from .metric import summarize_cross_dataset_correlations
+        except ImportError:
+            from metric import summarize_cross_dataset_correlations
+
+        summary = summarize_cross_dataset_correlations(
+            args.correlation_root, args.statistic_correlation_dataset, split_seed=args.correlation_split_seed,
+        )
+        output = ensure_output_dir(args.output_dir)
+        save_json(summary, output / "cross_dataset_correlations.json")
+        print(f"Dataset correlations saved to {output}.")
+        return
+
+    if not args.source_run_dir or not args.target_run_dir:
+        parser.error("Flow evaluation requires --source-run-dir and --target-run-dir.")
     if not args.check_only and not args.output_dir:
         parser.error("--output-dir is required for evaluation.")
     if args.calibration_dir and (args.check_only or calibration is not None or rank_evaluation is not None):
         parser.error("--calibration-dir requires an evaluation with no Python-supplied adapters.")
+    if args.target_target_control and (args.check_only or args.plot_velocity or len(args.target_run_dir) < 2):
+        parser.error("--target-target-control requires numeric evaluation with at least two target runs.")
     if args.plot_velocity:
         if args.check_only or args.calibration_dir or calibration is not None or rank_evaluation is not None:
             parser.error("--plot-velocity is a separate mode for the identity baseline.")
@@ -869,8 +969,8 @@ def main(
             parser.error("Velocity arrow count must be positive and the spot index must be nonnegative.")
         if shutil.which("latex") is None:
             parser.error("--plot-velocity requires LaTeX with amsmath and 'latex' on PATH.")
-    if min(args.fold, args.max_spots, args.num_times, args.batch_size, args.ode_steps) < 1:
-        parser.error("Fold, spots, times, batch size and ODE steps must be positive.")
+    if args.max_spots < 0 or min(args.fold, args.num_times, args.batch_size, args.ode_steps) < 1:
+        parser.error("Max spots must be nonnegative. Fold, times, batch size and ODE steps must be positive.")
     if min(args.fit_samples, args.evaluation_samples) < 2 or args.rff_features < 0:
         parser.error("Fit and evaluation require at least two samples each; RFF feature count must be nonnegative.")
     if not (np.isfinite(args.ridge) and args.ridge > 0) or args.seed < 0:

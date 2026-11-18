@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
@@ -61,20 +63,26 @@ def fixed_rbf_mmd_squared(
     return max(0.0, squared)  # Roundoff can make an exact zero slightly negative.
 
 
+_CALIBRATION_DELTA_COLUMNS = ("delta_mmd_squared", "delta_path_loss", "delta_mse")
+_CALIBRATION_CORRELATION_KEYS = tuple(
+    f"spearman_{column}_vs_delta_mse" for column in _CALIBRATION_DELTA_COLUMNS[:2]
+)
+
+
 def calibration_rank_correlations(delta_table: pd.DataFrame) -> dict:
     """Summarize the two descriptive Spearman coefficients across candidates."""
 
-    delta_columns = ["delta_mmd_squared", "delta_path_loss", "delta_mse"]
-    if any(column not in delta_table for column in delta_columns):
-        raise ValueError(f"Expected one row per calibration candidate with columns {delta_columns}.")
-    deltas = delta_table[delta_columns].to_numpy(dtype=np.float64)
+    if any(column not in delta_table for column in _CALIBRATION_DELTA_COLUMNS):
+        raise ValueError(
+            f"Expected one row per calibration candidate with columns {_CALIBRATION_DELTA_COLUMNS}."
+        )
+    deltas = delta_table[list(_CALIBRATION_DELTA_COLUMNS)].to_numpy(dtype=np.float64)
     if not np.isfinite(deltas).all():
         raise ValueError("Calibration score differences must be finite.")
 
     coefficients: dict[str, float | None] = {}
     undefined_reasons: dict[str, str] = {}
-    for index, column in enumerate(delta_columns[:2]):
-        key = f"spearman_{column}_vs_delta_mse"
+    for index, key in enumerate(_CALIBRATION_CORRELATION_KEYS):
         left, right = deltas[:, index], deltas[:, 2]
         if len(deltas) < 3:
             reason = "fewer_than_three_candidates"
@@ -86,6 +94,99 @@ def calibration_rank_correlations(delta_table: pd.DataFrame) -> dict:
         coefficients[key] = None
         undefined_reasons[key] = reason
     return {"n_candidates": len(deltas), "undefined_reasons": undefined_reasons, **coefficients}
+
+
+def _mean_defined_correlations(reports: Sequence[dict], count_key: str) -> dict:
+    means = {}
+    for key in _CALIBRATION_CORRELATION_KEYS:
+        values = [report[key] for report in reports if report[key] is not None]
+        means[key] = {"mean": float(np.mean(values)) if values else None, count_key: len(values)}
+    return means
+
+
+def summarize_cross_dataset_correlations(
+    root: str | Path, datasets: Sequence[str], *, split_seed: int = 0
+) -> dict:
+    """Summarize within-fold Spearman coefficients from existing ranking outputs."""
+
+    if not datasets or any(not dataset for dataset in datasets) or len(set(datasets)) != len(datasets):
+        raise ValueError("Provide a nonempty list of distinct dataset names.")
+    root = Path(root).expanduser()
+    subsets = ("all_candidates", "nonnegative_delta_mmd_squared")
+    comparable_settings = ("num_times", "fit_samples", "evaluation_samples", "rff_features", "ode_steps", "ridge")
+    sampling_settings: dict = {}
+    dataset_reports = []
+    for dataset in datasets:
+        pattern = re.compile(rf"{re.escape(dataset)}_seed{split_seed}_fold([1-9][0-9]*)")
+        fold_directories = {}
+        for path in root.iterdir():
+            match = pattern.fullmatch(path.name)
+            if match and path.is_dir():
+                fold_directories[int(match[1])] = path
+        if not fold_directories:
+            raise FileNotFoundError(f"No ranking directories for {dataset}_seed{split_seed} in {root}.")
+
+        folds = []
+        for fold, path in sorted(fold_directories.items()):
+            scores_path = path / "calibration_rank_scores.csv"
+            table = pd.read_csv(scores_path)
+            if (
+                table.empty or "candidate" not in table
+                or table["candidate"].isna().any() or table["candidate"].duplicated().any()
+            ):
+                raise ValueError(f"Expected one score row per distinct candidate in {scores_path}.")
+            summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
+            settings = summary.get("settings", {})
+            if settings.get("fold", fold) != fold:
+                raise ValueError(f"Fold in {path / 'summary.json'} differs from its directory name.")
+            test_spots, evaluated_spots = summary.get("test_spots"), summary.get("evaluated_spots")
+            protocol = {key: settings[key] for key in comparable_settings if key in settings}
+            if evaluated_spots is not None and test_spots is not None:
+                protocol["spot_coverage"] = "all_test_spots" if evaluated_spots == test_spots else evaluated_spots
+            if "target_seed_count" in summary:
+                protocol["target_seed_count"] = summary["target_seed_count"]
+            for key, value in protocol.items():
+                if key in sampling_settings and sampling_settings[key] != value:
+                    raise ValueError(
+                        f"Incompatible ranking setting {key!r} in {path}: "
+                        f"{value!r} differs from {sampling_settings[key]!r}."
+                    )
+                sampling_settings[key] = value
+
+            all_candidates = calibration_rank_correlations(table)
+            improved_mmd = table.loc[table["delta_mmd_squared"].astype(float) >= 0]
+            folds.append({
+                "fold": fold,
+                "scores_path": str(scores_path),
+                "n_test_spots": test_spots,
+                "n_evaluated_spots": evaluated_spots,
+                "n_target_seeds": summary.get("target_seed_count"),
+                "evaluation_seed": settings.get("seed"),
+                "sampling_settings": protocol,
+                "all_candidates": all_candidates,
+                "nonnegative_delta_mmd_squared": calibration_rank_correlations(improved_mmd),
+            })
+        dataset_reports.append({
+            "dataset": dataset,
+            "folds": folds,
+            "fold_equal_mean": {
+                subset: _mean_defined_correlations([fold[subset] for fold in folds], "n_defined_folds")
+                for subset in subsets
+            },
+        })
+
+    return {
+        "split_seed": split_seed,
+        "sampling_settings": sampling_settings,
+        "datasets": dataset_reports,
+        "dataset_equal_mean": {
+            subset: _mean_defined_correlations([
+                {key: item["mean"] for key, item in report["fold_equal_mean"][subset].items()}
+                for report in dataset_reports
+            ], "n_defined_datasets")
+            for subset in subsets
+        },
+    }
 
 
 def _as_frame(
