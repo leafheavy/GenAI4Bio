@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
@@ -52,6 +53,13 @@ class CalibrationRankEvaluation:
     candidates: Mapping[str, ObservedCalibrationAdapter]
     source_observed: np.ndarray | torch.Tensor
     mmd_bandwidth: float
+
+
+@dataclass(frozen=True)
+class VelocitySlice:
+    midpoint: np.ndarray
+    source: np.ndarray
+    target: np.ndarray
 
 
 def _load_prepared_calibration(
@@ -320,7 +328,8 @@ def _compare_time_and_candidates(
     *,
     calibrated_source: tuple[np.ndarray, np.ndarray] | None = None,
     rank_sources: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
-) -> tuple[dict[str, float], dict[str, float]]:
+    capture_velocity: bool = False,
+) -> tuple[dict[str, float], dict[str, float], VelocitySlice | None]:
     fit_states = np.concatenate((source_states[:fit_samples], target_states[:fit_samples]))
     basis = PotentialBasis.from_samples(fit_states, waves)
     probe = PotentialBasis.from_samples(fit_states, probe_waves)
@@ -367,7 +376,12 @@ def _compare_time_and_candidates(
         coefficients = basis.fit(states[:fit_samples], velocities[:fit_samples], ridge)
         difference = basis.velocity(midpoint, coefficients - target_coef)
         candidate_losses[name] = float(np.mean(np.sum(difference ** 2, axis=1))) / 2
-    return scores, candidate_losses
+    velocity_slice = None
+    if capture_velocity:
+        velocity_slice = VelocitySlice(
+            midpoint, basis.velocity(midpoint, source_coef), basis.velocity(midpoint, target_coef)
+        )
+    return scores, candidate_losses, velocity_slice
 
 
 def _compare_time(
@@ -382,7 +396,7 @@ def _compare_time(
     *,
     calibrated_source: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, float]:
-    scores, _ = _compare_time_and_candidates(
+    scores, _, _ = _compare_time_and_candidates(
         source_states, source_velocity, target_states, target_velocity, fit_samples,
         waves, probe_waves, ridge, calibrated_source=calibrated_source,
     )
@@ -403,6 +417,8 @@ def _compare_seed(
     calibration: CalibrationAdapter | None,
     rank_candidates: Mapping[str, ObservedCalibrationAdapter],
     score_endpoints: bool,
+    *,
+    velocity_slices: dict[float, VelocitySlice] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float], tuple[float, dict[str, float]] | None]:
     random = np.random.default_rng(args.seed)
     spots = np.sort(random.choice(test_indices, size=min(args.max_spots, len(test_indices)), replace=False))
@@ -411,10 +427,18 @@ def _compare_seed(
     missing = source.missing_mask.to(device)
     conditions = build_masked_condition(source.target_expression[spots.tolist()], observed)
     dimensions = int(source.missing_mask.sum())
+    if velocity_slices is not None and dimensions < 2:
+        raise ValueError("The velocity plot requires at least two missing genes for PCA.")
     waves = _directions(random, args.rff_features, dimensions)
     probe_waves = _directions(random, max(8, args.rff_features), dimensions)
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
     times = ((np.arange(args.num_times) + 0.5) / args.num_times).tolist()
+    plot_spot = None
+    if velocity_slices is not None:
+        plot_spot = int(spots[0]) if args.velocity_spot is None else args.velocity_spot
+        if plot_spot not in spots:
+            raise ValueError(f"Velocity plot spot {plot_spot} is not among the sampled ST test spots.")
+    plot_times = {0, len(times) // 2, len(times) - 1}
     rows = []
     candidate_path_loss = dict.fromkeys(rank_candidates, 0.0)
     baseline_mse = 0.0
@@ -423,6 +447,9 @@ def _compare_seed(
         noise = torch.randn(
             args.fit_samples + args.evaluation_samples, len(source.genes), generator=generator
         )
+        if velocity_slices is not None and spot != plot_spot:
+            # Advance the same noise stream as the numeric comparison.
+            continue
         source_samples = _path_samples(
             source.sampler, condition, missing, noise, times, args.batch_size,
             include_endpoint=score_endpoints,
@@ -450,11 +477,13 @@ def _compare_seed(
             for name, samples in candidate_samples.items():
                 candidate_mse[name] += _endpoint_mse(samples[2], truth, args.fit_samples)
         for time_index, time in enumerate(times):
+            if velocity_slices is not None and time_index not in plot_times:
+                continue
             calibrated_source = (
                 None if calibration is None else
                 (calibrated_states[time_index], calibrated_velocity[time_index])
             )
-            scores, path_losses = _compare_time_and_candidates(
+            scores, path_losses, velocity_slice = _compare_time_and_candidates(
                 source_states[time_index], source_velocity[time_index],
                 target_states[time_index], target_velocity[time_index],
                 args.fit_samples, waves, probe_waves, args.ridge,
@@ -463,7 +492,10 @@ def _compare_seed(
                     name: (samples[0][time_index], samples[1][time_index])
                     for name, samples in candidate_samples.items()
                 },
+                capture_velocity=velocity_slices is not None,
             )
+            if velocity_slices is not None and velocity_slice is not None:
+                velocity_slices[time] = velocity_slice
             for name, loss in path_losses.items():
                 candidate_path_loss[name] += loss
             rows.append({
@@ -478,6 +510,101 @@ def _compare_seed(
             {name: loss / len(spots) for name, loss in candidate_mse.items()},
         )
     return rows, {name: loss / len(rows) for name, loss in candidate_path_loss.items()}, endpoint_losses
+
+
+def _plot_velocity_fields(
+    slices_by_seed: Mapping[int, Mapping[float, VelocitySlice]],
+    *,
+    fold: int,
+    spot: int,
+    max_arrows: int,
+    destination: Path,
+) -> None:
+    from matplotlib import pyplot as plt
+    from matplotlib.patches import Patch
+    from sklearn.decomposition import PCA
+
+    seeds = sorted(slices_by_seed)
+    times = sorted(slices_by_seed[seeds[0]])
+    points = np.concatenate([slices_by_seed[seed][time].midpoint for seed in seeds for time in times])
+    pca = PCA(n_components=2, svd_solver="full").fit(points)
+    projected = pca.transform(points)
+    projection = pca.components_.T
+
+    panels = []
+    for seed in seeds:
+        for time in times:
+            item = slices_by_seed[seed][time]
+            base = pca.transform(item.midpoint)
+            # Spread the arrow tails over the sampled cloud by farthest-point selection.
+            index = int(np.argmin(np.sum((base - base.mean(axis=0)) ** 2, axis=1)))
+            chosen = []
+            nearest = np.full(len(base), np.inf)
+            for _ in range(min(max_arrows, len(base))):
+                chosen.append(index)
+                nearest = np.minimum(nearest, np.sum((base - base[index]) ** 2, axis=1))
+                index = int(nearest.argmax())
+                if nearest[index] <= 0:
+                    break
+            panels.append((
+                base, base[chosen], item.source[chosen] @ projection, item.target[chosen] @ projection,
+            ))
+
+    # Use one conversion from velocity to arrow length across all panels.
+    span = max(float(np.ptp(projected, axis=0).max()), 1e-6)
+    vectors = np.concatenate([vectors for _, _, source, target in panels for vectors in (source, target)])
+    max_speed = max(float(np.linalg.norm(vectors, axis=1).max()), 1e-8)
+    length_scale = 0.18 * span / max_speed
+    limits = np.stack((projected.min(axis=0) - 0.24 * span, projected.max(axis=0) + 0.24 * span))
+    source_color = "#4B5563"
+    target_colors = ("#D9E7F4", "#FFC7CE", "#FFF9D9")
+    with plt.rc_context({
+        "text.usetex": True,
+        "text.latex.preamble": r"\usepackage{amsmath}",
+        "font.family": "serif",
+    }):
+        figure, axes = plt.subplots(
+            len(seeds), len(times), squeeze=False, sharex=True, sharey=True,
+            figsize=(3.2 * len(times) + 0.8, 3.0 * len(seeds) + 0.95),
+        )
+        try:
+            for row, seed in enumerate(seeds):
+                for column, time in enumerate(times):
+                    axis = axes[row, column]
+                    base, anchors, source, target = panels[row * len(times) + column]
+                    axis.scatter(*base.T, s=5, color="#CDD3DA", linewidths=0)
+                    for velocity, color, width in (
+                        (source, source_color, 0.010), (target, target_colors[row], 0.007),
+                    ):
+                        axis.quiver(
+                            *anchors.T, *(velocity * length_scale).T,
+                            angles="xy", scale_units="xy", scale=1, pivot="tail", width=width,
+                            color=color, edgecolor="#374151", linewidth=0.45,
+                        )
+                    axis.scatter(*anchors.T, s=9, color="#374151", linewidths=0, zorder=4)
+                    axis.set(xlim=limits[:, 0], ylim=limits[:, 1], aspect="equal")
+                    if row == 0:
+                        axis.set_title(fr"$t={time:.3g}$")
+                    if column == 0:
+                        axis.set_ylabel(f"Target {seed}\nPC 2")
+                    if row == len(seeds) - 1:
+                        axis.set_xlabel("PC 1")
+            handles = [Patch(facecolor=source_color, edgecolor="#374151", label="Source flow")]
+            handles.extend(
+                Patch(facecolor=color, edgecolor="#374151", label=f"Target {seed}")
+                for seed, color in zip(seeds, target_colors)
+            )
+            figure.suptitle(f"Velocity fields at shared probes (fold {fold}, ST spot {spot})")
+            figure.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False)
+            figure.tight_layout(rect=(0, 0.06, 1, 0.95))
+            temporary = destination.with_suffix(".pdf.tmp")
+            try:
+                figure.savefig(temporary, format="pdf")
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        finally:
+            plt.close(figure)
 
 
 @torch.no_grad()
@@ -571,6 +698,7 @@ def run_comparison(
 ) -> None:
     """Evaluate fitted flows and optionally compare supplied calibrations."""
     device = torch.device("cpu") if args.check_only else resolve_device(args.device)
+    plot_velocity = getattr(args, "plot_velocity", False)
     rank_candidates = rank_evaluation.candidates if rank_evaluation is not None else {}
     if rank_evaluation is not None and not args.check_only:
         if not rank_candidates or any(not isinstance(name, str) or not name.strip() for name in rank_candidates):
@@ -583,6 +711,8 @@ def run_comparison(
     candidate_path_losses: dict[int, dict[str, float]] = {}
     endpoint_losses = None
     output = None
+    velocity_by_seed: dict[int, dict[float, VelocitySlice]] = {}
+    plotted_spot = None
     for source, target_sampler, target, test_indices, target_dir, seed in _load_pairs(args, device):
         print(
             f"Flow checkpoints ready for fold {args.fold}, target seed {seed}: "
@@ -594,6 +724,15 @@ def run_comparison(
                     rank_evaluation = _load_prepared_calibration(args, source, test_indices)
                     rank_candidates = rank_evaluation.candidates
                 output = ensure_output_dir(args.output_dir)
+            if plot_velocity:
+                velocity_by_seed[seed] = {}
+                seed_rows, _, _ = _compare_seed(
+                    args, source, target_sampler, test_indices, seed, None, {}, False,
+                    velocity_slices=velocity_by_seed[seed],
+                )
+                plotted_spot = int(seed_rows[0]["spot_index"])
+                del target_sampler, target
+                continue
             seed_rows, seed_candidate_losses, seed_endpoint_losses = _compare_seed(
                 args, source, target_sampler, test_indices, seed, calibration,
                 rank_candidates, score_endpoints=bool(rank_candidates) and endpoint_losses is None,
@@ -613,6 +752,14 @@ def run_comparison(
             }
         del target_sampler, target
     if args.check_only:
+        return
+    if plot_velocity:
+        destination = output / f"velocity_fold{args.fold:02d}_spot{plotted_spot}.pdf"
+        _plot_velocity_fields(
+            velocity_by_seed, fold=args.fold, spot=plotted_spot,
+            max_arrows=args.velocity_arrows, destination=destination,
+        )
+        print(f"Velocity plot saved to {destination}.")
         return
 
     metrics = pd.DataFrame(rows)
@@ -691,6 +838,12 @@ def main(
     parser.add_argument("--check-only", action="store_true", help="Check prerequisite runs on CPU.")
     parser.add_argument("--output-dir")
     parser.add_argument("--calibration-dir", help="Evaluate frozen candidates from prepare_observed_calibration.py.")
+    parser.add_argument(
+        "--plot-velocity", action="store_true",
+        help="Write a PDF of the source and target velocities at shared identity midpoints.",
+    )
+    parser.add_argument("--velocity-spot", type=int, help="Sampled ST row index (default: first sampled row).")
+    parser.add_argument("--velocity-arrows", type=int, default=8, help="Maximum arrow pairs per panel.")
     parser.add_argument("--device")
     parser.add_argument("--max-spots", type=int, default=16)
     parser.add_argument("--num-times", type=int, default=5)
@@ -707,6 +860,15 @@ def main(
         parser.error("--output-dir is required for evaluation.")
     if args.calibration_dir and (args.check_only or calibration is not None or rank_evaluation is not None):
         parser.error("--calibration-dir requires an evaluation with no Python-supplied adapters.")
+    if args.plot_velocity:
+        if args.check_only or args.calibration_dir or calibration is not None or rank_evaluation is not None:
+            parser.error("--plot-velocity is a separate mode for the identity baseline.")
+        if len(args.target_run_dir) > 3:
+            parser.error("--plot-velocity accepts up to three target runs.")
+        if args.velocity_arrows < 1 or (args.velocity_spot is not None and args.velocity_spot < 0):
+            parser.error("Velocity arrow count must be positive and the spot index must be nonnegative.")
+        if shutil.which("latex") is None:
+            parser.error("--plot-velocity requires LaTeX with amsmath and 'latex' on PATH.")
     if min(args.fold, args.max_spots, args.num_times, args.batch_size, args.ode_steps) < 1:
         parser.error("Fold, spots, times, batch size and ODE steps must be positive.")
     if min(args.fit_samples, args.evaluation_samples) < 2 or args.rff_features < 0:
