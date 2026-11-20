@@ -18,11 +18,18 @@ from scipy.spatial.distance import cdist
 try:
     from .random_re_masking import build_masked_condition
     from .source_flow import SourceFlowODESampler, load_source_flow_checkpoint, load_source_flow_run
-    from .utils import ensure_output_dir, load_json, resolve_device, save_json
+    from .utils import ensure_output_dir, load_json, resolve_device, save_json, sha256_file
 except ImportError:
     from random_re_masking import build_masked_condition
     from source_flow import SourceFlowODESampler, load_source_flow_checkpoint, load_source_flow_run
-    from utils import ensure_output_dir, load_json, resolve_device, save_json
+    from utils import ensure_output_dir, load_json, resolve_device, save_json, sha256_file
+
+
+BASELINE_REFERENCE_VERSION = 1
+BASELINE_SETTINGS = (
+    "fold", "max_spots", "num_times", "fit_samples", "evaluation_samples",
+    "batch_size", "rff_features", "ode_steps", "ridge", "seed",
+)
 
 
 class CalibrationAdapter(Protocol):
@@ -116,6 +123,12 @@ class PotentialBasis:
     def from_samples(cls, states: np.ndarray, waves: np.ndarray) -> PotentialBasis:
         center = states.mean(axis=0)
         bandwidth = max(float(np.sqrt(np.mean((states - center) ** 2))), 1e-6)
+        return cls.from_normalization(center, bandwidth, waves)
+
+    @classmethod
+    def from_normalization(
+        cls, center: np.ndarray, bandwidth: float, waves: np.ndarray
+    ) -> PotentialBasis:
         axes = np.eye(center.size)
         return cls(center, bandwidth, waves, np.concatenate((axes, axes, waves, waves)))
 
@@ -146,6 +159,40 @@ class PotentialBasis:
 def _directions(generator: np.random.Generator, count: int, dimensions: int) -> np.ndarray:
     waves = generator.standard_normal((count, dimensions))
     return waves / np.linalg.norm(waves, axis=1, keepdims=True)
+
+
+def _evaluation_plan(args, test_indices: np.ndarray, dimensions: int):
+    random = np.random.default_rng(args.seed)
+    spot_count = min(args.max_spots or len(test_indices), len(test_indices))
+    spots = np.sort(random.choice(test_indices, size=spot_count, replace=False))
+    waves = _directions(random, args.rff_features, dimensions)
+    probe_waves = _directions(random, max(8, args.rff_features), dimensions)
+    times = ((np.arange(args.num_times) + 0.5) / args.num_times).tolist()
+    return spots, waves, probe_waves, times
+
+
+def _spot_inputs(args, source, spots: np.ndarray):
+    observed = source.observed_mask.to(source.target_expression.device)
+    conditions = build_masked_condition(source.target_expression[spots.tolist()], observed)
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    for spot, condition in zip(spots, conditions):
+        noise = torch.randn(
+            args.fit_samples + args.evaluation_samples, len(source.genes), generator=generator
+        )
+        yield spot, condition, noise
+
+
+def _baseline_reference_dtype(args, dimensions: int) -> np.dtype:
+    return np.dtype([
+        ("center", np.float64, (dimensions,)),
+        ("bandwidth", np.float64),
+        ("target_coefficients", np.float64, (2 * (dimensions + args.rff_features),)),
+        ("midpoint", np.float64, (args.evaluation_samples, dimensions)),
+    ])
+
+
+def _baseline_reference_path(root: Path, seed: int) -> Path:
+    return root / f"baseline_reference_seed{seed}.npy"
 
 
 @torch.no_grad()
@@ -247,7 +294,7 @@ def _load_target_checkpoint(args: argparse.Namespace, run_dir: Path, device: tor
     )
 
 
-def _load_pairs(args: argparse.Namespace, device: torch.device):
+def _paired_run_dirs(args: argparse.Namespace) -> tuple[Path, list[Path]]:
     source_dir = Path(args.source_run_dir).expanduser().resolve()
     target_runs = args.target_run_dir
     if isinstance(target_runs, (str, Path)):
@@ -255,6 +302,19 @@ def _load_pairs(args: argparse.Namespace, device: torch.device):
     target_dirs = [Path(value).expanduser().resolve() for value in target_runs]
     if not target_dirs or len(set(target_dirs)) != len(target_dirs):
         raise ValueError("Provide at least one target run and list each target directory once.")
+    return source_dir, target_dirs
+
+
+def _checkpoint_hashes(args: argparse.Namespace) -> list[str]:
+    source_dir, target_dirs = _paired_run_dirs(args)
+    return [
+        sha256_file(run_dir / "checkpoints" / f"fold_{args.fold:02d}.pt")
+        for run_dir in (source_dir, *target_dirs)
+    ]
+
+
+def _load_pairs(args: argparse.Namespace, device: torch.device):
+    source_dir, target_dirs = _paired_run_dirs(args)
     sources = [("source", source_dir), *(("target", root) for root in target_dirs)]
     checkpoint_name = f"fold_{args.fold:02d}.pt"
     required = ("experiment.json", "data_info.json", "gene_folds.json", f"checkpoints/{checkpoint_name}")
@@ -325,6 +385,20 @@ def _load_pairs(args: argparse.Namespace, device: torch.device):
         del target_sampler, target, _
 
 
+def _candidate_path_loss(
+    basis: PotentialBasis,
+    midpoint: np.ndarray,
+    target_coefficients: np.ndarray,
+    states: np.ndarray,
+    velocities: np.ndarray,
+    fit_samples: int,
+    ridge: float,
+) -> float:
+    coefficients = basis.fit(states[:fit_samples], velocities[:fit_samples], ridge)
+    difference = basis.velocity(midpoint, coefficients - target_coefficients)
+    return float(np.mean(np.sum(difference ** 2, axis=1))) / 2
+
+
 def _compare_time_and_candidates(
     source_states: np.ndarray,
     source_velocity: np.ndarray,
@@ -338,6 +412,7 @@ def _compare_time_and_candidates(
     calibrated_source: tuple[np.ndarray, np.ndarray] | None = None,
     rank_sources: Mapping[str, tuple[np.ndarray, np.ndarray]] | None = None,
     capture_velocity: bool = False,
+    baseline_reference: np.void | None = None,
 ) -> tuple[dict[str, float], dict[str, float], VelocitySlice | None]:
     fit_states = np.concatenate((source_states[:fit_samples], target_states[:fit_samples]))
     basis = PotentialBasis.from_samples(fit_states, waves)
@@ -351,6 +426,11 @@ def _compare_time_and_candidates(
     distances = cdist(source_eval, target_eval, metric="sqeuclidean")
     source_order, target_order = linear_sum_assignment(distances)
     midpoint = (source_eval[source_order] + target_eval[target_order]) / 2
+    if baseline_reference is not None:
+        baseline_reference["center"] = basis.center
+        baseline_reference["bandwidth"] = basis.bandwidth
+        baseline_reference["target_coefficients"] = target_coef
+        baseline_reference["midpoint"] = midpoint
     difference = basis.velocity(midpoint, source_coef - target_coef)
     squared_gap = float(np.mean(np.sum(difference ** 2, axis=1)))
     scores = {
@@ -382,9 +462,9 @@ def _compare_time_and_candidates(
         )
     candidate_losses = {}
     for name, (states, velocities) in (rank_sources or {}).items():
-        coefficients = basis.fit(states[:fit_samples], velocities[:fit_samples], ridge)
-        difference = basis.velocity(midpoint, coefficients - target_coef)
-        candidate_losses[name] = float(np.mean(np.sum(difference ** 2, axis=1))) / 2
+        candidate_losses[name] = _candidate_path_loss(
+            basis, midpoint, target_coef, states, velocities, fit_samples, ridge
+        )
     velocity_slice = None
     if capture_velocity:
         velocity_slice = VelocitySlice(
@@ -430,23 +510,21 @@ def _compare_seed(
     *,
     velocity_slices: dict[float, VelocitySlice] | None = None,
     reference_sampler: SourceFlowODESampler | None = None,
+    baseline_reference_path: Path | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float], tuple[float, dict[str, float]] | None]:
-    random = np.random.default_rng(args.seed)
-    spot_count = min(args.max_spots or len(test_indices), len(test_indices))
-    spots = np.sort(random.choice(test_indices, size=spot_count, replace=False))
     if reference_sampler is None:
         reference_sampler = source.sampler
-    device = source.target_expression.device
-    observed = source.observed_mask.to(device)
-    missing = source.missing_mask.to(device)
-    conditions = build_masked_condition(source.target_expression[spots.tolist()], observed)
+    missing = source.missing_mask.to(source.target_expression.device)
     dimensions = int(source.missing_mask.sum())
     if velocity_slices is not None and dimensions < 2:
         raise ValueError("The velocity plot requires at least two missing genes for PCA.")
-    waves = _directions(random, args.rff_features, dimensions)
-    probe_waves = _directions(random, max(8, args.rff_features), dimensions)
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
-    times = ((np.arange(args.num_times) + 0.5) / args.num_times).tolist()
+    spots, waves, probe_waves, times = _evaluation_plan(args, test_indices, dimensions)
+    baseline_reference = None
+    if baseline_reference_path is not None:
+        baseline_reference = np.lib.format.open_memmap(
+            baseline_reference_path, mode="w+", dtype=_baseline_reference_dtype(args, dimensions),
+            shape=(len(spots), len(times)),
+        )
     plot_spot = None
     if velocity_slices is not None:
         plot_spot = int(spots[0]) if args.velocity_spot is None else args.velocity_spot
@@ -457,10 +535,7 @@ def _compare_seed(
     candidate_path_loss = dict.fromkeys(rank_candidates, 0.0)
     baseline_mse = 0.0
     candidate_mse = dict.fromkeys(rank_candidates, 0.0)
-    for spot, condition in zip(spots, conditions):
-        noise = torch.randn(
-            args.fit_samples + args.evaluation_samples, len(source.genes), generator=generator
-        )
+    for spot_number, (spot, condition, noise) in enumerate(_spot_inputs(args, source, spots)):
         if velocity_slices is not None and spot != plot_spot:
             # Advance the same noise stream as the numeric comparison.
             continue
@@ -505,6 +580,10 @@ def _compare_seed(
                     for name, samples in candidate_samples.items()
                 },
                 capture_velocity=velocity_slices is not None,
+                baseline_reference=(
+                    baseline_reference[spot_number, time_index]
+                    if baseline_reference is not None else None
+                ),
             )
             if velocity_slices is not None and velocity_slice is not None:
                 velocity_slices[time] = velocity_slice
@@ -515,6 +594,8 @@ def _compare_seed(
                 "target_seed": target_seed,
                 **scores,
             })
+    if baseline_reference is not None:
+        baseline_reference.flush()
     endpoint_losses = None
     if score_endpoints:
         endpoint_losses = (
@@ -779,6 +860,103 @@ def _calibration_rank_scores(
     }
 
 
+def _load_baseline_results(args):
+    root = Path(args.baseline_dir).expanduser().resolve()
+    summary = load_json(root / "summary.json")
+    reference = summary.get("baseline_reference")
+    if not isinstance(reference, dict) or reference.get("format_version") != BASELINE_REFERENCE_VERSION:
+        raise ValueError(f"{root} needs a baseline saved with --save-baseline-reference.")
+    settings = summary["settings"]
+    changed = [name for name in BASELINE_SETTINGS if settings.get(name) != getattr(args, name)]
+    if changed:
+        raise ValueError(f"Evaluation settings differ from the saved baseline: {', '.join(changed)}.")
+    if reference["checkpoint_sha256"] != _checkpoint_hashes(args):
+        raise ValueError("Flow checkpoints or the target run order differ from the saved baseline.")
+    path = root / "path_comparison.csv"
+    if reference["path_comparison_sha256"] != sha256_file(path):
+        raise ValueError(f"Path scores differ from the saved baseline: {path}.")
+    return root, summary, pd.read_csv(path, float_precision="round_trip")
+
+
+def _compare_saved_calibrations(args, root, source, test_indices, targets, candidates):
+    dimensions = int(source.missing_mask.sum())
+    missing = source.missing_mask.to(source.target_expression.device)
+    spots, waves, _, times = _evaluation_plan(args, test_indices, dimensions)
+    dtype = _baseline_reference_dtype(args, dimensions)
+    references = {}
+    for seed in targets:
+        path = _baseline_reference_path(root, seed)
+        saved = np.load(path, mmap_mode="r", allow_pickle=False)
+        if saved.shape != (len(spots), len(times)) or saved.dtype != dtype:
+            raise ValueError(f"Invalid baseline reference array: {path}.")
+        references[seed] = saved
+
+    candidate_losses = {seed: dict.fromkeys(candidates, 0.0) for seed in targets}
+    candidate_mse = dict.fromkeys(candidates, 0.0)
+    for spot_number, (spot, condition, noise) in enumerate(_spot_inputs(args, source, spots)):
+        truth = source.target_expression[spot, missing].cpu().numpy()
+        truth = np.clip((truth + 1.0) / 2.0, 0.0, 1.0)
+        samples = {
+            name: _path_samples(
+                source.sampler, condition, missing, noise, times, args.batch_size,
+                calibration=adapter, include_endpoint=True,
+            )
+            for name, adapter in candidates.items()
+        }
+        for name, (_, _, endpoints) in samples.items():
+            candidate_mse[name] += _endpoint_mse(endpoints, truth, args.fit_samples)
+        for seed, saved in references.items():
+            for time_index, reference in enumerate(saved[spot_number]):
+                basis = PotentialBasis.from_normalization(
+                    reference["center"], float(reference["bandwidth"]), waves,
+                )
+                for name, (states, velocities, _) in samples.items():
+                    candidate_losses[seed][name] += _candidate_path_loss(
+                        basis, reference["midpoint"], reference["target_coefficients"],
+                        states[time_index], velocities[time_index], args.fit_samples, args.ridge,
+                    )
+    for losses in candidate_losses.values():
+        for name in losses:
+            losses[name] /= len(spots) * len(times)
+    return spots.tolist(), candidate_losses, {name: loss / len(spots) for name, loss in candidate_mse.items()}
+
+
+def _run_with_baseline(args: argparse.Namespace, device: torch.device) -> None:
+    root, summary, metrics = _load_baseline_results(args)
+    reference = summary.pop("baseline_reference")
+    targets = {}
+    for source, sampler, target, test_indices, target_dir, seed in _load_pairs(args, device):
+        targets[seed] = {"target_run_dir": str(target_dir)}
+        del sampler, target
+    if reference["test_indices"] != test_indices.tolist():
+        raise ValueError("The ST test split differs from the saved baseline.")
+
+    output = ensure_output_dir(args.output_dir)
+    if args.calibration_dir:
+        evaluation = _load_prepared_calibration(args, source, test_indices)
+        spots, candidate_losses, candidate_mse = _compare_saved_calibrations(
+            args, root, source, test_indices, targets, evaluation.candidates,
+        )
+        baseline_losses = {
+            int(seed): sum(group["half_squared_velocity_gap"]) / len(group)
+            for seed, group in metrics.groupby("target_seed", sort=False)
+        }
+        scores, rank_summary = _calibration_rank_scores(
+            evaluation, source, spots, baseline_losses, candidate_losses,
+            (reference["endpoint_mse"], candidate_mse),
+        )
+        rank_summary["endpoint_evaluation_draws"] = args.evaluation_samples
+        scores.to_csv(output / "calibration_rank_scores.csv", index=False)
+        save_json(rank_summary, output / "calibration_rank_summary.json")
+    if args.target_target_control:
+        control = _compare_target_seeds(args, source, test_indices, targets, device)
+        control.to_csv(output / "target_target_path_comparison.csv", index=False)
+        save_json(_target_seed_control_summary(metrics, control), output / "target_target_summary.json")
+    summary.update(baseline_dir=str(root), settings=vars(args))
+    save_json(summary, output / "summary.json")
+    print(f"Evaluation using the saved baseline at {root} written to {output}.")
+
+
 def run_comparison(
     args: argparse.Namespace,
     *,
@@ -787,6 +965,11 @@ def run_comparison(
 ) -> None:
     """Evaluate fitted flows and optionally compare supplied calibrations."""
     device = torch.device("cpu") if args.check_only else resolve_device(args.device)
+    if getattr(args, "baseline_dir", None):
+        _run_with_baseline(args, device)
+        return
+    save_reference = getattr(args, "save_baseline_reference", False)
+    checkpoint_hashes = _checkpoint_hashes(args) if save_reference else None
     plot_velocity = getattr(args, "plot_velocity", False)
     rank_candidates = rank_evaluation.candidates if rank_evaluation is not None else {}
     if rank_evaluation is not None and not args.check_only:
@@ -824,7 +1007,9 @@ def run_comparison(
                 continue
             seed_rows, seed_candidate_losses, seed_endpoint_losses = _compare_seed(
                 args, source, target_sampler, test_indices, seed, calibration,
-                rank_candidates, score_endpoints=bool(rank_candidates) and endpoint_losses is None,
+                rank_candidates,
+                score_endpoints=(bool(rank_candidates) or save_reference) and endpoint_losses is None,
+                baseline_reference_path=_baseline_reference_path(output, seed) if save_reference else None,
             )
             rows.extend(seed_rows)
             if rank_candidates:
@@ -871,10 +1056,20 @@ def run_comparison(
         rank_summary["endpoint_evaluation_draws"] = args.evaluation_samples
         rank_scores.to_csv(output / "calibration_rank_scores.csv", index=False)
         save_json(rank_summary, output / "calibration_rank_summary.json")
-    metrics.to_csv(output / "path_comparison.csv", index=False)
+    metrics_path = output / "path_comparison.csv"
+    metrics.to_csv(metrics_path, index=False)
     if target_control is not None:
         target_control.to_csv(output / "target_target_path_comparison.csv", index=False)
         save_json(_target_seed_control_summary(metrics, target_control), output / "target_target_summary.json")
+    baseline_metadata = {}
+    if save_reference:
+        baseline_metadata["baseline_reference"] = {
+            "format_version": BASELINE_REFERENCE_VERSION,
+            "checkpoint_sha256": checkpoint_hashes,
+            "path_comparison_sha256": sha256_file(metrics_path),
+            "test_indices": test_indices.tolist(),
+            "endpoint_mse": endpoint_losses[0],
+        }
     save_json({
         "measure": "fixed_path_minimum_kinetic_velocity_gap",
         "primary_metric": primary_metric,
@@ -911,6 +1106,7 @@ def run_comparison(
             by_time[seed_scores].std(ddof=1).reset_index().to_dict("records")
             if len(targets) > 1 else None
         ),
+        **baseline_metadata,
     }, output / "summary.json")
     print(f"Path comparison saved to {output}.")
 
@@ -933,6 +1129,14 @@ def main(
     parser.add_argument("--check-only", action="store_true", help="Check prerequisite runs on CPU.")
     parser.add_argument("--output-dir")
     parser.add_argument("--calibration-dir", help="Evaluate frozen candidates from prepare_observed_calibration.py.")
+    parser.add_argument(
+        "--save-baseline-reference", action="store_true",
+        help="Save the reference paths and identity endpoint MSE for separate follow-up evaluations.",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        help="Reuse a saved source–target baseline for target–target or calibration evaluation.",
+    )
     parser.add_argument(
         "--target-target-control", action="store_true",
         help="Also compare all unordered pairs of target seeds on the same evaluation grid and noise.",
@@ -964,7 +1168,8 @@ def main(
     if args.statistic_correlation_dataset:
         if (
             args.source_run_dir or args.target_run_dir or args.calibration_dir or args.check_only
-            or args.plot_velocity or args.target_target_control or calibration is not None
+            or args.plot_velocity or args.target_target_control or args.baseline_dir
+            or args.save_baseline_reference or calibration is not None
             or rank_evaluation is not None
         ):
             parser.error("Dataset correlation summaries read saved results and run separately from flow evaluation.")
@@ -987,6 +1192,13 @@ def main(
         parser.error("Flow evaluation requires --source-run-dir and --target-run-dir.")
     if not args.check_only and not args.output_dir:
         parser.error("--output-dir is required for evaluation.")
+    if args.save_baseline_reference and (args.check_only or args.plot_velocity or args.baseline_dir):
+        parser.error("--save-baseline-reference requires a new numeric source–target evaluation.")
+    if args.baseline_dir and (
+        args.check_only or args.plot_velocity or calibration is not None or rank_evaluation is not None
+        or not (args.target_target_control or args.calibration_dir)
+    ):
+        parser.error("--baseline-dir requires --target-target-control or --calibration-dir.")
     if args.calibration_dir and (args.check_only or calibration is not None or rank_evaluation is not None):
         parser.error("--calibration-dir requires an evaluation with no Python-supplied adapters.")
     if args.target_target_control and (args.check_only or args.plot_velocity or len(args.target_run_dir) < 2):
